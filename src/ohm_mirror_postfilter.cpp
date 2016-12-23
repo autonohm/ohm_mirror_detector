@@ -11,15 +11,19 @@
 #include <ros/ros.h>
 #include <sensor_msgs/LaserScan.h>
 #include <std_msgs/Bool.h>
+#include <tf/transform_listener.h>
 #include <ohm_mirror_detector/ohm_maskLaser_msgs.h>
-
+#include <ohm_mirror_detector/ohm_poseLaser_msgs.h>
 
 #include <visualization_msgs/Marker.h>
 
 #include "rosfunctions.h"
+#include "lineFunctions.h"
 
 #include <float.h>
 #include <cmath>
+#include "ransac.h"
+#include "reflectionIdentifier.h"
 
 #include <sstream>
 
@@ -29,22 +33,38 @@
 #include "obcore/base/Time.h"
 #include "obvision/reconstruct/grid/SensorPolar2D.h"
 
+// To write in file
+#include <iostream>
+#include <fstream>
+
 // ROS variables
 ros::Publisher _pub_scan;
 ros::Publisher _pub_error;
+ros::Publisher _pub_mirror;
+ros::Publisher _pub_transparent;
+ros::Publisher _pub_additional;
+
 ros::Publisher _pub_marker;
 ros::Publisher _pub_path;
+
+tf::TransformListener* _transformListener = NULL;
 
 sensor_msgs::LaserScan _scan;
 nav_msgs::Path _path;
 visualization_msgs::Marker _marker_points;
 visualization_msgs::Marker _marker_line_strip;
 
-int newContainerElements = 1000;                                     // amount of new elements
+int newContainerElements = 100;                                                     // amount of new elements
 std::vector<obvious::SensorPolar2D*> _sensorHistory(newContainerElements);					// save history of echo 1
 std::vector<obvious::SensorPolar2D*> _sensorHistory2(newContainerElements);         // save history of echo 2
-std::vector<obvious::Matrix*> _mirrorHistory(newContainerElements);							    // save mirror corners (left corner, right corner)
+std::vector<obvious::Matrix*> _mirrorHistory1(newContainerElements);							  // save history of all points assigned to mirror (in Real-World-Coordinates
+std::vector<obvious::Matrix*> _mirrorHistory2(newContainerElements);                // save history of all points assigned to mirror (in Real-World-Coordinates
+std::vector<double*> _mirrorHistoryIntens1(newContainerElements);                   // save history of all intensity 1 of points assigned to mirror
+std::vector<double*> _mirrorHistoryIntens2(newContainerElements);                   // save history of all intensity 2 of points assigned to mirror
+
 std::vector<obvious::Matrix*> _mirrorHistory_T(newContainerElements);						    // save the position of the Mirror
+std::vector<obvious::Matrix*> _cornerHistory(newContainerElements);                 // save history of all corner points (in Real-World-Coordinates
+int* _corner_object_type = new int[newContainerElements];                           // displays type of object of all checks
 
 std::vector<unsigned int> _seq(newContainerElements);
 
@@ -55,7 +75,23 @@ double _th_new_corner = 0.2;                    // [m] minimal distance between 
 double _th_angleThreshold = 5;                  // [°] additional threshold angle at the mirror sector, makes the sector lightly bigger
 double _th_openingAnglePrefilter = 1;           // [°] minimal angle to check for mirror points at an incoming scan
 
+double _th_MinPointsForICP = 100;               // minimal amount of points to check with ICP for reflection
+double _th_maxDiffDistICPTrans = 0.1;           // [m] maximal difference in distance between Transformations to identify as the same reflection
+double _th_maxDiffAngleICPTrans = 5;            // [°] maximal difference between in angle Transformations to identify as the same reflection
+
+double _norm_white_intensity = 10000;           // value of intensity value of white paper at 1m
+
+double _max_intensityValue = 60000;             // maximal intensity of scanner
+double _th_phongSpreding = 0.1;                 // +-0.1 = +-10%, max. distance between two intensity values of points next to each other
+double _th_phongFactor = 0.8;                   // [0.8 = 80%] switching factor to identify mirror or glass
+
+
+int _ransac_iterations            = 100;        // max. number of iterations allowed in the ransac
+float _ransac_threshold           = 0.05;       // threshold value for determining when a data point fits the model
+int _ransac_points2fit            = 20;         // min. number of data values required to fit the model
+
 double _angle_increment = 0;
+double _angle_diff = 0;
 double _maxRange = 30;
 double _minRange = 0;
 int _posecounter = 0;
@@ -66,6 +102,8 @@ std::string _frame_id = "";
 
 unsigned int _sensorDataCounter = 0;
 unsigned int _mirrorHistoryCounter = 0;
+unsigned int _mirrorCornerCounter = 0;
+
 bool _publishOn = false;
 bool _finalBacktrace = false;
 bool _poseReceived = false;
@@ -78,125 +116,116 @@ using namespace std;
 using namespace cv;
 using namespace obvious;
 
-void subscriberPose(const geometry_msgs::PoseStamped& pose)
-{
- // cout << "Pose in: " << _sensorDataCounter << endl;
-  _path.poses.resize(_sensorDataCounter+1);
-
-  _path.header.seq          = pose.header.seq;
-  _path.header.stamp        = pose.header.stamp;
-  _path.header.frame_id     = pose.header.frame_id;
-
-  _path.poses[_sensorDataCounter].header.seq          = pose.header.seq;
-  _path.poses[_sensorDataCounter].header.stamp        = pose.header.stamp;
-  _path.poses[_sensorDataCounter].header.frame_id     = pose.header.frame_id;
-
-  _path.poses[_sensorDataCounter].pose.position.x     = pose.pose.position.x;
-  _path.poses[_sensorDataCounter].pose.position.y     = pose.pose.position.y;
-  _path.poses[_sensorDataCounter].pose.position.z     = pose.pose.position.z;
-
-  _path.poses[_sensorDataCounter].pose.orientation.x  = pose.pose.orientation.x;
-  _path.poses[_sensorDataCounter].pose.orientation.y  = pose.pose.orientation.y;
-  _path.poses[_sensorDataCounter].pose.orientation.z  = pose.pose.orientation.z;
-  _path.poses[_sensorDataCounter].pose.orientation.w  = pose.pose.orientation.w;
-//  cout << "Nr: " << pose.pose.position.x  << "/" << pose.pose.position.y << "/" << pose.pose.position.z << endl;
-//  cout << "Nr: " << pose.pose.orientation.x << "/" << pose.pose.orientation.y << "/" << pose.pose.orientation.z << "/" << pose.pose.orientation.w << endl;
-//  cout << "Nr: " << _poseStamped.size() << "_" << _posecounter << ": " <<_poseStamped[_posecounter].pose.position.x  << "/" << _poseStamped[_posecounter].pose.position.y << "/" << _poseStamped[_posecounter].pose.position.z << endl;
-
-  /*
-   * calculate the tranformation matrix
-   */
-  obvious::Quaternion q(pose.pose.orientation.w, pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z);
-  obvious::Matrix R = q.Quaternion::convertToMatrix();
-  obvious::Matrix Tr(3,3);
-  obvious::Matrix T = _sensorHistory[_sensorDataCounter]->getTransformation();
-  Tr(0,0) = 1;
-  Tr(0,2) = pose.pose.position.x;
-  Tr(1,1) = 1;
-  Tr(1,2) = pose.pose.position.y;
-  Tr(2,2) = 1;
-  T = Tr*R;
-
-//  cout << "Mirror-Detector - Postfilter pose in" << _posecounter << endl;
-//  cout << pose.pose.position.x << "/" << pose.pose.position.y << "/" << pose.pose.position.z << endl;
-//  cout << pose.pose.orientation.x << "/" << pose.pose.orientation.y << "/" << pose.pose.orientation.z << "/" << pose.pose.orientation.w << endl;
-
- _sensorHistory[_sensorDataCounter]->setTransformation(T);
- _sensorHistory2[_sensorDataCounter]->setTransformation(T);
- _poseReceived = true;
-}
+//To test
+bool _only_one_time = 0;
+int _tmp_count = 0;
 
 void subscribermaskScan(const ohm_mirror_detector::ohm_maskLaser_msgs& maskScan)
 {
   /*
-   * copy maskScan msg into obvious sensor
+   * get position of the scan from tf
    */
-  if(_poseReceived)
+  tf::StampedTransform transform;
+  ros::Time laser_timestamp = maskScan.header.stamp;
+  bool gotTransformation = true;
+  try
   {
-    _sensorDataCounter++;
-    _poseReceived = false;
-    _scanReceived = false;
+    //wait till transform is avaiable
+    _transformListener->waitForTransform("/map", "/laser", ros::Time::now(), ros::Duration(1.0));
+    (*_transformListener).lookupTransform("/map", "/laser", laser_timestamp, transform);
   }
-  // take first occuring scan. Ignore all, till a pose received. Then first occuring scan and ignore again all scans till new pose is received
-  if(!_scanReceived)
+  catch (tf::TransformException ex)
+  {
+    ROS_ERROR("%s",ex.what());
+    gotTransformation = false;
+  }
+  if(gotTransformation)
   {
     /*
-     * copy scan 1 & 2
-     * scan 1 includes points, which are supposed to be valid, mirror or transparent points
-     * scan 2 includes points, which are already identified as erroneous points
+     * copy maskScan msg into obvious sensor
      */
-    obvious::SensorPolar2D* sensor = new obvious::SensorPolar2D(maskScan.echo_1.ranges.size(), maskScan.echo_1.angle_increment, maskScan.echo_1.angle_min, _maxRange, _minRange, _lowReflectivityRange);
-    obvious::SensorPolar2D* sensor2 = new obvious::SensorPolar2D(maskScan.echo_2.ranges.size(), maskScan.echo_2.angle_increment, maskScan.echo_2.angle_min, _maxRange, _minRange, _lowReflectivityRange);
+      /*
+       * copy scan 1 & 2
+       * scan 1 includes points, which are supposed to be valid, mirror or transparent points
+       * scan 2 includes points, which are already identified as erroneous points
+       */
+      obvious::SensorPolar2D* sensor = new obvious::SensorPolar2D(maskScan.echo_1.ranges.size(), maskScan.echo_1.angle_increment, maskScan.echo_1.angle_min, _maxRange, _minRange, _lowReflectivityRange);
+      obvious::SensorPolar2D* sensor2 = new obvious::SensorPolar2D(maskScan.echo_2.ranges.size(), maskScan.echo_2.angle_increment, maskScan.echo_2.angle_min, _maxRange, _minRange, _lowReflectivityRange);
 
-    unsigned int size = maskScan.echo_1.ranges.size();
-    _frame_id = maskScan.header.frame_id;
-    _scanangle = maskScan.echo_1.angle_max - maskScan.echo_1.angle_min;
-    _seq[_sensorDataCounter] = maskScan.header.seq;
-    _angle_increment = maskScan.echo_1.angle_increment;
+      unsigned int size = maskScan.echo_1.ranges.size();
 
-    double* data = new double[size];
-    double* data2 = new double[size];
-    int* object_mask = new int[size];
+      _frame_id = maskScan.header.frame_id;
+      _scanangle = maskScan.echo_1.angle_max - maskScan.echo_1.angle_min;
+      _angle_diff = _scanangle;
+      _seq[_sensorDataCounter] = maskScan.header.seq;
+      _angle_increment = maskScan.echo_1.angle_increment;
 
-    for(int i = 0; i < size; i++)
-    {
-      data[i] = maskScan.echo_1.ranges[i];
-      data2[i] = maskScan.echo_2.ranges[i];
-      object_mask[i] = maskScan.object_mask[i];
-
-      // check for mirror
-      if(object_mask[i] == 2)
+      double* data    = new double[size];
+      double* intens    = new double[size];
+      double* data2     = new double[size];
+      double* intens2    = new double[size];
+      int* object_mask  = new int[size];
+      for(int i = 0; i < size; i++)
       {
-        _new_mirror = true;
+        data[i]         = maskScan.echo_1.ranges[i];
+        intens[i]       = maskScan.echo_1.intensities[i];
+        data2[i]        = maskScan.echo_2.ranges[i];
+        intens2[i]      = maskScan.echo_2.intensities[i];
+
+        object_mask[i]  = maskScan.object_mask[i];
+
+        // check for mirror or transparent object
+        if(object_mask[i] != 0)
+        {
+          _new_mirror = true;
+        }
       }
-    }
-    sensor->resetMask();
-    sensor2->resetMask();
+      sensor->resetMask();
+      sensor2->resetMask();
 
-    sensor->setRealMeasurementData(data, 1.0);
-    sensor2->setRealMeasurementData(data2, 1.0);
+      sensor->setRealMeasurementData(data, 1.0);
+      sensor2->setRealMeasurementData(data2, 1.0);
 
-    sensor->setRealMeasurementTypeID(object_mask);
-    sensor2->setRealMeasurementTypeID(object_mask);
+      sensor->setRealMeasurementTypeID(object_mask);
+      sensor2->setRealMeasurementTypeID(object_mask);
+      sensor->setRealMeasurementAccuracy(intens);
+      sensor2->setRealMeasurementAccuracy(intens2);
 
-    /*
-     * copy sensor into history
-     */
-    //resize, if necessary
-    if(_sensorHistory.size() == _sensorDataCounter)
-    {
-      _sensorHistory.resize(_sensorDataCounter + newContainerElements);
-      _sensorHistory2.resize(_sensorDataCounter + newContainerElements);
-      _seq.resize(_sensorDataCounter + newContainerElements);
-    }
-    _sensorHistory[_sensorDataCounter] = sensor;
-    _sensorHistory2[_sensorDataCounter] = sensor2;
+      /*
+       * calculate the tranformation matrix
+       */
+      obvious::Quaternion q(transform.getRotation().getW(), transform.getRotation().getX(), transform.getRotation().getY(), transform.getRotation().getZ());
+      obvious::Matrix R = q.Quaternion::convertToMatrix();
+      obvious::Matrix Tr(3,3);
+      obvious::Matrix T = sensor->getTransformation();
+      Tr(0,0) = 1;
+      Tr(0,2) = transform.getOrigin().getX();
+      Tr(1,1) = 1;
+      Tr(1,2) = transform.getOrigin().getY();
+      Tr(2,2) = 1;
+      T = Tr*R;
 
-    _scanReceived = true;
+      sensor->setTransformation(T);
+      sensor2->setTransformation(T);
 
-    delete data;
-    delete data2;
-    delete object_mask;
+      _sensorHistory[_sensorDataCounter] = sensor;
+      _sensorHistory2[_sensorDataCounter] = sensor2;
+      _sensorDataCounter++;
+
+      /*
+       * copy sensor into history
+       */
+      //resize, if necessary
+      if(_sensorHistory.size() == _sensorDataCounter)
+      {
+        _sensorHistory.resize(_sensorDataCounter + newContainerElements);
+        _sensorHistory2.resize(_sensorDataCounter + newContainerElements);
+        _seq.resize(_sensorDataCounter + newContainerElements);
+      }
+  
+      delete data;
+      delete data2;
+      delete object_mask;
   }
 }
 
@@ -206,16 +235,26 @@ void subscriberActivatePub(std_msgs::Bool activate)
   _publishOn = true;
 }
 
-void publisherFuncScan(std::vector<obvious::SensorPolar2D*> history, std::vector<obvious::SensorPolar2D*> history2, int historynr)
+void publisherFuncScan(std::vector<obvious::SensorPolar2D*>& history, std::vector<obvious::SensorPolar2D*>& history2, std::vector<obvious::Matrix*>& cornerHistory, int historynr, int mirror_histCounter, int* object_type)
 {
-  //ROS_INFO("Publish cleaned history");
-
   int size = history[0]->getRealMeasurementSize();
   double* tmp_data;
   double* tmp_data2;
+  double* tmp_dataMirrored  = new double[size];
+  double* tmp_coordMirrored  = new double[2*size];
+  bool* tmp_mask = new bool[size];
+
+  double* tmp_intens;
+  double* tmp_intens2;
+  double* tmp_intensMirrored = new double[size];
   int* tmp_object_mask;
   int* tmp_object_mask2;
-  int* tmp_object_mask_test;
+  bool* tmp_beenMoved = new bool[size];
+
+  bool scan_finished = true;
+  bool additional_object = true;
+  ros::Time now = ros::Time::now();
+  bool mirrored_object = false;
 
   /*
    * create msg for refined scan
@@ -223,65 +262,74 @@ void publisherFuncScan(std::vector<obvious::SensorPolar2D*> history, std::vector
   sensor_msgs::LaserScan msgCleanedScan;
   msgCleanedScan.header.frame_id = _frame_id;
   msgCleanedScan.angle_min = history[0]->getPhiMin();
-  //TODO: Save real PhiMax in Sensor and make a return function
   msgCleanedScan.angle_max = -history[0]->getPhiMin();
   msgCleanedScan.angle_increment = _angle_increment;
-  //	scan_out.time_increment  		=
-  //	scan_out.scan_time        		=
   msgCleanedScan.range_min = history[0]->getMinimumRange();
   msgCleanedScan.range_max = history[0]->getMaximumRange();
   msgCleanedScan.ranges.resize(size);
   msgCleanedScan.intensities.resize(size);
-  msgCleanedScan.header.stamp = ros::Time::now();
+  msgCleanedScan.header.stamp = now;
   msgCleanedScan.header.seq = _seq[historynr];
+
+  /*
+  * create msg for mirror scan
+  */
+  sensor_msgs::LaserScan msgMirror;
+  msgMirror.ranges.resize(size);
+  msgMirror.intensities.resize(size);
+
+  /*
+  * create msg for transparent scan
+  */
+  sensor_msgs::LaserScan msgTransparent;
+  msgTransparent.ranges.resize(size);
+  msgTransparent.intensities.resize(size);
 
   /*
   * create msg for error scan
   */
   sensor_msgs::LaserScan msgError;
-  msgError.header.frame_id = _frame_id;
-  msgError.angle_min = history[0]->getPhiMin();
-  //TODO: Save real PhiMax in Sensor and make a return function
-  msgError.angle_max = -history[0]->getPhiMin();
-  msgError.angle_increment = _angle_increment;
-  //	scan_out.time_increment  		=
-  //	scan_out.scan_time        		=
-  msgError.range_min = history[0]->getMinimumRange();
-  msgError.range_max = history[0]->getMaximumRange();
   msgError.ranges.resize(size);
   msgError.intensities.resize(size);
-  msgError.header.stamp = ros::Time::now();
-  msgError.header.seq = _seq[historynr];
+
+  /*
+  * create msg for additional scan points to update the map
+  */
+  ohm_mirror_detector::ohm_poseLaser_msgs msgAdditional;
+  msgAdditional.object.ranges.resize(size);
+  msgAdditional.object.intensities.resize(size);
+  msgAdditional.object_mask.resize(size);
 
   /*
   * clean up scan history
   */
   obvious::SensorPolar2D* tmp_sensor;
   obvious::SensorPolar2D* tmp_sensor2;
-  obvious::SensorPolar2D* tmp_sensor_test;
 
   obvious::Matrix* corners_tmp = new obvious::Matrix(2, 2);
 
-  tmp_sensor = history[historynr];
-  tmp_sensor2 = history[historynr];
-  tmp_sensor_test = history[historynr];
+  tmp_sensor          = history[historynr];
+  tmp_sensor2         = history[historynr];
 
-  for(int i = 0; i < _mirrorHistoryCounter; i++)//_mirrorHistoryCounter
+  /*
+   * get data to publish
+   */
+  tmp_data            = tmp_sensor->getRealMeasurementData();
+  tmp_data2           = tmp_sensor2->getRealMeasurementData();
+  tmp_intens          = tmp_sensor->getRealMeasurementAccuracy();
+  tmp_intens2         = tmp_sensor2->getRealMeasurementAccuracy();
+
+  /*
+   * clean up object mask and replace mirrored points
+   */
+  for(int i = 0; i < mirror_histCounter; i++)
   {
-       (*corners_tmp)(0,0) = (*_mirrorHistory[i])(0,0);
-       (*corners_tmp)(0,1) = (*_mirrorHistory[i])(0,1);
-       (*corners_tmp)(1,0) = (*_mirrorHistory[i])(1,0);
-       (*corners_tmp)(1,1) = (*_mirrorHistory[i])(1,1);
+    (*corners_tmp)(0,0) = (*cornerHistory[i])(0,0);
+    (*corners_tmp)(0,1) = (*cornerHistory[i])(0,1);
+    (*corners_tmp)(1,0) = (*cornerHistory[i])(1,0);
+    (*corners_tmp)(1,1) = (*cornerHistory[i])(1,1);
+    // For visualization
 
-       // TODO: include here a fix Testpoint
-//    (*corners_tmp)(0,0) = 2.0;
-//    (*corners_tmp)(0,1) = 0.3;
-//    (*corners_tmp)(1,0) = 1.8;
-//    (*corners_tmp)(1,1) = -0.3;
-//    cout << "Corners: " << endl;
-//    corners_tmp->print();
-
-//    // For visualisation
     geometry_msgs::Point p;
     p.x = (*corners_tmp)(0, 0);
     p.y = (*corners_tmp)(0, 1);
@@ -296,110 +344,229 @@ void publisherFuncScan(std::vector<obvious::SensorPolar2D*> history, std::vector
     pubPoints();
     pubLines();
 
-//    cout << "Check corner: " << endl;
-//    corners_tmp->print();
-
-//       cout << "Hist: " << (*corners_tmp)(0,0) << "/" << (*corners_tmp)(0,1) << endl;
-
-//    cout << "mask before " << endl;
-    //tmp_object_mask = tmp_sensor->getRealMeasurementTypeID();
-    tmp_object_mask_test = tmp_sensor->getRealMeasurementTypeID();
-
-//    for(int j = 0; j < size; j++)
-//    {
-//      cout << tmp_object_mask[j] << "/";
-//    }
-//    cout << endl;
+    /*
+     * clean up scans: assign reflective objects, reflected points and erroneous points
+     */
+    cleanScan((*corners_tmp), tmp_sensor, _th_mirrorline, _th_angleThreshold, object_type[i]);
+    cleanScan((*corners_tmp), tmp_sensor2, _th_mirrorline, _th_angleThreshold, (object_type[i]+1));  // object_type +  1 = error of object_type
 
 
-    cleanScan((*corners_tmp), tmp_sensor, _th_mirrorline, _th_angleThreshold);
-
-    //cout << "mask after: " << endl;
-//    tmp_object_mask = tmp_sensor->getRealMeasurementTypeID();
-//
-//    for(int j = 0; j < size; j++)
-//    {
-//      if(tmp_object_mask[j] != tmp_object_mask_test[j])
-//      cout << tmp_object_mask[j] << "/";
-//    }
-//    cout << endl;
-
+    /*
+     * only if object is a mirror
+     * calculate original location of mirrored points and move them
+     */
+    if(object_type[i] == 1)
+    {
+      for(int j = 0; j < size; j++)
+      {
+        tmp_intensMirrored[j]     = tmp_intens[j];
+      }
+      mirrored_object = replaceMirroredPoints((*corners_tmp), tmp_sensor, tmp_coordMirrored, object_type[i], tmp_beenMoved);
+    }
   }
 
-  tmp_data = tmp_sensor->getRealMeasurementData();
-  tmp_data2 = tmp_sensor2->getRealMeasurementData();
-  tmp_object_mask = tmp_sensor->getRealMeasurementTypeID();
-  tmp_object_mask2 = tmp_sensor2->getRealMeasurementTypeID();
+  /*
+   * moved convert coords to distance
+   */
+  if(mirrored_object)
+  {
+    convertxy2RosSort(tmp_coordMirrored, tmp_dataMirrored, size, _angle_increment);
+    for(unsigned int i = 0; i <= size; i++)
+    {
+      if(tmp_dataMirrored[i] != 0)
+        msgError.ranges[i] = tmp_dataMirrored[i];
+      else
+        msgError.ranges[i] = INFINITY;
+    }
+  }
 
+  /*
+   * get cleaned object masked
+   */
+  tmp_object_mask     = tmp_sensor->getRealMeasurementTypeID();
+  tmp_object_mask2    = tmp_sensor2->getRealMeasurementTypeID();
 
   /*
    * fill laser msgs
    */
-  for(unsigned int i = 0; i < size; i++)
-  {
-    //TODO: Intensities
-    switch(tmp_object_mask[i]){
-      case 0: // scan
-        msgCleanedScan.ranges[i] = tmp_data[i];
-        msgError.ranges[i] = 0;
-        break;
-      case 1: // mirror
-        msgCleanedScan.ranges[i] = tmp_data[i];
-        msgError.ranges[i] = 0;
-        break;
-      case 2: // error_mirror
-        msgCleanedScan.ranges[i] = 0;
-        // TODO: Check in another way!
-        // when case 1 or 3 applies, there are also points behind it. These can also be used
-        if(tmp_data[i] != 0.0)
-        {
-          msgError.ranges[i] = tmp_data[i];
-         // cout << msgError.ranges[i] << "/";
-        }
-        else
-        {
-          msgError.ranges[i] = tmp_data2[i];
-        }
-//        cout << tmp_data[i] << "-" << tmp_data2[i] << "/";
-        break;
-      case 3: // transparent
-        msgCleanedScan.ranges[i] = tmp_data[i];
-        msgError.ranges[i] = 0;
-        break;
-      case 4: // error_transparent
-        msgCleanedScan.ranges[i] = 0;
-        //TODO: Check in another way!
-        if(tmp_data[i] != 0.0)
-        {
-          msgError.ranges[i] = tmp_data[i];
-        }
-        else
-        {
-          msgError.ranges[i] = tmp_data2[i];
-        }
-        break;
-      default:
-        msgCleanedScan.ranges[i] = 0;
-        if(tmp_data[i] != 0.0)
-        {
-          msgError.ranges[i] = tmp_data[i];
-        }
-        else
-        {
-          msgError.ranges[i] = tmp_data2[i];
-        }
-    }
-    //cout << msgCleanedScan.ranges[i] << "-" << tmp_object_mask[i] << "/";
-     // cout <<  tmp_object_mask[i] << "/";
+     for(unsigned int i = 0; i <= size; i++)
+     {
+       msgAdditional.object_mask[i] = tmp_object_mask[i];
+       switch(tmp_object_mask[i]){
+         case 0: // scan
+           msgCleanedScan.ranges[i]      = tmp_data[i];
+           msgCleanedScan.intensities[i] = tmp_intens[i];
 
-  }
-//  cout << endl;
+           msgMirror.ranges[i]           = INFINITY;
+           msgMirror.intensities[i]      = INFINITY;
 
-  _pub_error.publish(msgError);
-  _pub_scan.publish(msgCleanedScan);
-//  _pub_mirror.publish(_msgInitMirrorMsg);
+           msgTransparent.ranges[i]      = INFINITY;
+           msgTransparent.intensities[i] = INFINITY;
+
+           msgAdditional.object.ranges[i]      = INFINITY;
+           msgAdditional.object.intensities[i] = INFINITY;
+           break;
+         case 1: // mirror
+           msgCleanedScan.ranges[i]      = tmp_data[i];
+           msgCleanedScan.intensities[i] = tmp_intens[i];
+
+           msgMirror.ranges[i]           = tmp_data[i];
+           msgMirror.intensities[i]      = tmp_intens[i];
+
+           msgTransparent.ranges[i]      = INFINITY;
+           msgTransparent.intensities[i] = INFINITY;
+
+           msgAdditional.object.ranges[i]      = tmp_data[i];
+           msgAdditional.object.intensities[i] = tmp_intens[i];
+           additional_object = true;
+           break;
+         case 2: // error_mirror
+           msgCleanedScan.ranges[i]      = INFINITY;
+           msgCleanedScan.intensities[i] = INFINITY;
+
+           msgMirror.ranges[i]           = INFINITY;
+           msgMirror.intensities[i]      = INFINITY;
+
+           msgTransparent.ranges[i]      = INFINITY;
+           msgTransparent.intensities[i] = INFINITY;
+
+           msgAdditional.object.ranges[i]      = INFINITY;
+           msgAdditional.object.intensities[i] = INFINITY;
+           additional_object = true;
+           break;
+         case 3: // transparent
+           msgCleanedScan.ranges[i]      = tmp_data[i];
+           msgCleanedScan.intensities[i] = tmp_intens[i];
+
+           msgMirror.ranges[i]           = INFINITY;
+           msgMirror.intensities[i]      = INFINITY;
+
+           msgTransparent.ranges[i]      = tmp_data[i];
+           msgTransparent.intensities[i] = tmp_intens[i];
+
+           msgAdditional.object.ranges[i]      = tmp_data[i];
+           msgAdditional.object.intensities[i] = tmp_intens[i];
+           additional_object = true;
+           break;
+         case 4: // error_transparent
+           msgCleanedScan.ranges[i]      = tmp_data[i];
+           msgCleanedScan.intensities[i] = tmp_intens[i];
+
+           msgMirror.ranges[i]           = INFINITY;
+           msgMirror.intensities[i]      = INFINITY;
+
+           msgTransparent.ranges[i]      = tmp_data[i];
+           msgTransparent.intensities[i] = tmp_intens[i];
+
+           msgAdditional.object.ranges[i]      = INFINITY;
+           msgAdditional.object.intensities[i] = INFINITY;
+           break;
+         case 5: //  error_mirror recalculated
+           msgCleanedScan.ranges[i]      = INFINITY;
+           msgCleanedScan.intensities[i] = INFINITY;
+
+           break;
+         default:
+           msgCleanedScan.ranges[i]      = tmp_dataMirrored[i];
+           msgCleanedScan.intensities[i] = 0;
+
+           msgMirror.ranges[i]      = INFINITY;
+           msgMirror.intensities[i] = INFINITY;
+
+           msgTransparent.ranges[i]      = INFINITY;
+           msgTransparent.intensities[i] = INFINITY;
+
+           msgAdditional.object.ranges[i]      = tmp_dataMirrored[i];
+       }
+     }
+
+     if(additional_object)
+     {
+       /*
+       * create msg for mirror scan
+       */
+       msgMirror.header.frame_id = _frame_id;
+       msgMirror.angle_min = history[0]->getPhiMin();
+       msgMirror.angle_max = -history[0]->getPhiMin();
+       msgMirror.angle_increment = _angle_increment;
+       msgMirror.range_min = history[0]->getMinimumRange();
+       msgMirror.range_max = history[0]->getMaximumRange();
+       msgMirror.header.stamp = now;
+       msgMirror.header.seq = _seq[historynr];
+
+       /*
+       * create msg for transparent scan
+       */
+       msgTransparent.header.frame_id = _frame_id;
+       msgTransparent.angle_min = history[0]->getPhiMin();
+       msgTransparent.angle_max = -history[0]->getPhiMin();
+       msgTransparent.angle_increment = _angle_increment;
+       msgTransparent.range_min = history[0]->getMinimumRange();
+       msgTransparent.range_max = history[0]->getMaximumRange();
+       msgTransparent.header.stamp = now;
+       msgTransparent.header.seq = _seq[historynr];
+
+       /*
+       * create msg for error scan
+       */
+       msgError.header.frame_id = _frame_id;
+       msgError.angle_min = history[0]->getPhiMin();
+       msgError.angle_max = -history[0]->getPhiMin();
+       msgError.angle_increment = _angle_increment;
+       msgError.range_min = history[0]->getMinimumRange();
+       msgError.range_max = history[0]->getMaximumRange();
+       msgError.header.stamp = now;
+       msgError.header.seq = _seq[historynr];
+
+       /*
+       * create msg for additional scan points to update the map
+       */
+       // Set scan
+       msgAdditional.header.frame_id = _frame_id;
+       msgAdditional.object.angle_min = history[0]->getPhiMin();
+       msgAdditional.object.angle_max = -history[0]->getPhiMin();
+       msgAdditional.object.angle_increment = _angle_increment;
+       msgAdditional.object.range_min = history[0]->getMinimumRange();
+       msgAdditional.object.range_max = history[0]->getMaximumRange();
+       msgAdditional.object.header.stamp = now;
+       msgAdditional.object.header.seq = _seq[historynr];
+
+       // get position
+       obvious::Matrix T = tmp_sensor->getTransformation();
+
+       msgAdditional.pose.position.x = (T)(0, 2);
+       msgAdditional.pose.position.y = (T)(1, 2);
+       msgAdditional.pose.position.z = 0;
+
+       // calc rotation
+       tf::Quaternion quat;
+       double curTheta          = 0.0;
+       const double ARCSIN   = asin((T)(1,0));
+       const double ARCSINEG = asin((T)(0,1));
+       const double ARCOS    = acos((T)(0,0));
+       if((ARCSIN > 0.0) && (ARCSINEG < 0.0))
+         curTheta = ARCOS;
+       else if((ARCSIN < 0.0) && (ARCSINEG > 0.0))
+         curTheta = 2.0 * M_PI - ARCOS;
+
+       quat.setEuler(0.0, 0.0, curTheta);
+       msgAdditional.pose.orientation.x = quat.x();
+       msgAdditional.pose.orientation.y = quat.y();
+       msgAdditional.pose.orientation.z = quat.z();
+       msgAdditional.pose.orientation.w = quat.w();
+
+       // publish scans
+      _pub_error.publish(msgError);
+      _pub_mirror.publish(msgMirror);
+      _pub_transparent.publish(msgTransparent);
+      _pub_additional.publish(msgAdditional);
+     }
+     _pub_scan.publish(msgCleanedScan);
 
   delete corners_tmp;
+  delete tmp_dataMirrored;
+  delete tmp_coordMirrored;
+  delete tmp_mask;
 }
 
 void pubPoints()
@@ -429,31 +596,45 @@ void pubLines()
   _pub_marker.publish(_marker_line_strip);
 }
 
-
-void postFiltering(std::vector<obvious::SensorPolar2D*> scan_history, std::vector<obvious::Matrix*>& mHistory, std::vector<
-    obvious::Matrix*>& mHistory_T, unsigned int history_count, unsigned int& mirror_count)
+void buildHistory(std::vector<obvious::SensorPolar2D*>& scan_history, std::vector<obvious::SensorPolar2D*>& scan_history2, std::vector<obvious::Matrix*>& mHistory, std::vector<obvious::Matrix*>& mHistory2, std::vector<
+    obvious::Matrix*>& mHistory_T, unsigned int history_count, unsigned int& mirror_count, std::vector<double*>& mHistoryIntens1, std::vector<double*>& mHistoryIntens2)
 {
-  //ROS_INFO("Start to clean history");
   /*
    * get mirror data from last sensordata
    */
   unsigned int h_count = history_count - 1;
+
   int size = scan_history[0]->getRealMeasurementSize();
+
   double* data = new double[2 * size];
+  double* data2 = new double[2 * size];
+
+  double* intens1 = new double[size];
+  double* intens2 = new double[size];
   double* scan;
+  bool found_mirror = 0;
+  int count_valid  = 0;
+  int m = 0;
 
   bool* data_validmask = new bool[size];
   int* object_mask;
 
   obvious::Matrix* mirror_corners = new obvious::Matrix(2, 2);
   obvious::Matrix* mirror_matrix = new obvious::Matrix(size, 2);
-
+  obvious::Matrix* mirror_matrix2 = new obvious::Matrix(size, 2);
   obvious::Matrix moved_mirror_matrix(size, 2);
+  obvious::Matrix moved_mirror_matrix2(size, 2);
+  obvious::Matrix* transform = new obvious::Matrix(3, 3);
 
   scan_history[h_count]->dataToCartesianVectorMask(data, data_validmask);
+
+  scan_history2[h_count]->dataToCartesianVectorMask(data2, data_validmask);
   scan = scan_history[h_count]->getRealMeasurementData();
+  intens1 = scan_history[h_count]->getRealMeasurementAccuracy();
+  intens2 = scan_history2[h_count]->getRealMeasurementAccuracy();
 
   object_mask = scan_history[h_count]->getRealMeasurementTypeID();
+
   for(int i = 0; i < size; i++)
   {
     if((object_mask[i] == 1))
@@ -462,6 +643,12 @@ void postFiltering(std::vector<obvious::SensorPolar2D*> scan_history, std::vecto
       {
         (*mirror_matrix)(i, 0) = data[i * 2];
         (*mirror_matrix)(i, 1) = data[i * 2 + 1];
+        (*mirror_matrix2)(i, 0) = data2[i * 2];
+        (*mirror_matrix2)(i, 1) = data2[i * 2 + 1];
+        object_mask[i] = 1;
+
+        count_valid++;
+        found_mirror = 1;
       }
       else
       {
@@ -472,44 +659,63 @@ void postFiltering(std::vector<obvious::SensorPolar2D*> scan_history, std::vecto
     {
       (*mirror_matrix)(i, 0) = NAN;
       (*mirror_matrix)(i, 1) = NAN;
+      (*mirror_matrix2)(i, 0) = NAN;
+      (*mirror_matrix2)(i, 1) = NAN;
     }
   }
-  // get position and bring Mirror into coordinate system "Map"
+
   obvious::Matrix T = scan_history[h_count]->getTransformation();
   obvious::Matrix* T_scan = &T;
+  for(int i=0; i < 3; i++)
+  {
+    for(int j= 0; j < 3; j++)
+    {
+      (*transform)(i,j) = T(i,j);
+    }
+  }
 
   moved_mirror_matrix = mirror_matrix->createTransform(*T_scan);
+  moved_mirror_matrix2 = mirror_matrix2->createTransform(*T_scan);
 
   /*
-   * analyze last scan, with mirror to get mirror corners
+   * store all moved mirror points
+   * in one "mirror_count" are all mirror points from one scan stored
    */
-  // get points
-  bool corner_points;
-  corner_points = getCornerPoints(moved_mirror_matrix, *mirror_corners, data_validmask);
-
-  /*
-   * check if mirror already was found before
-   */
-  bool new_mirror = false;
-  if((mirror_count == 0) && corner_points)
+  if(found_mirror)
   {
-    // set first corner points
-    mHistory[0] = mirror_corners;
-    mHistory_T[0] = T_scan;
+    obvious::Matrix* tmp_points = new obvious::Matrix((count_valid+1), 2);
+    obvious::Matrix* tmp_points2 = new obvious::Matrix((count_valid+1), 2);
+    double* tmp_intens1 = new double[count_valid+1];
+    double* tmp_intens2 = new double[count_valid+1];
+
+    for(int i= 0; i < size-1; i++)
+    {
+       if((!(isnan(moved_mirror_matrix(i,0)))) && (object_mask[i]))
+       {
+         (*tmp_points)(m,0) = (moved_mirror_matrix)(i,0);
+         (*tmp_points)(m,1) = (moved_mirror_matrix)(i,1);
+         (*tmp_points2)(m,0) = (moved_mirror_matrix2)(i,0);
+         (*tmp_points2)(m,1) = (moved_mirror_matrix2)(i,1);
+         tmp_intens1[m] = intens1[i];
+         tmp_intens2[m] = intens2[i];
+         m++;
+       }
+    }
+
+    mHistory[mirror_count] = tmp_points;
+    mHistory2[mirror_count] = tmp_points2;
+    mHistoryIntens1[mirror_count] = tmp_intens1;
+    mHistoryIntens2[mirror_count] = tmp_intens2;
+    mHistory_T[mirror_count] = transform;
 
     mirror_count++;
-    new_mirror = true;
-  }
-  else if((mirror_count == 1) && corner_points)
-  {
-      new_mirror = checkMirrorHistory(*mirror_corners, *T_scan, mHistory, mHistory_T, _th_new_corner, _th_mirrorline, mirror_count);
   }
 
   delete data;
   delete data_validmask;
   delete mirror_matrix;
+  delete mirror_matrix2;
 }
-
 
 bool getCornerPoints(obvious::Matrix mirror_matrix, obvious::Matrix& corners, bool* mask)
 {
@@ -556,10 +762,6 @@ bool getCornerPoints(obvious::Matrix mirror_matrix, obvious::Matrix& corners, bo
   (corners)(1, 0) = (mirror_matrix)(index_right_corner, 0);
   (corners)(1, 1) = (mirror_matrix)(index_right_corner, 1);
 
-//	cout << "New corner left: " << index_left_corner << "->" << (corners)(0,0) << "/" << (corners)(0,1) << endl;
-//	cout << "New corner right: " << index_right_corner << "->" << (corners)(1,0) << "/" << (corners)(1,1) << endl;
-//	cout << endl;
-
   delete angle;
   delete distance;
 
@@ -567,231 +769,121 @@ bool getCornerPoints(obvious::Matrix mirror_matrix, obvious::Matrix& corners, bo
     return 0;
 
   return 1;
-
-//	cout << "Corners:" << endl;
-//	cout << "left: " << (corners)(0,0) << "/" << (corners)(0,1) << endl;
-//	cout << "right: " << (corners)(1,0) << "/" << (corners)(1,1) << endl;
 }
-
-bool checkMirrorHistory(obvious::Matrix& corner_points, obvious::Matrix& T_corner_points, std::vector<obvious::Matrix*>& history, std::vector<
-    obvious::Matrix*>& T_history, double th_new_mirror, double th_mirrorline, unsigned int& historysize)
+bool getCornerPoints2(std::vector<obvious::Matrix*>& mirror_pointsHistory, std::vector<obvious::Matrix*>& cornerHistory, unsigned int& counter_points, unsigned int& counter_corners, int ransac_points2fit, int ransac_iterations, double ransac_threshold, double th_mirrorline, int* objectIdentificationResult)
 {
-  //see book 05/12/15
   /*
-   * check for points at origin or with NAN
+   * copy whole matrix to a temp. array
    */
-  if(((corner_points)(0, 0) == 0) && ((corner_points)(0, 1) == 0))
-    return 0;
-  if(((corner_points)(1, 0) == 0) && ((corner_points)(1, 1) == 0))
-    return 0;
-  if(isnan((corner_points)(1, 0)) && isnan((corner_points)(1, 1)))
-    return 0;
-  if(isnan((corner_points)(1, 0)) && isnan((corner_points)(1, 1)))
-    return 0;
-
-  // check history for similar mirror
-  double distance_r1 = 0.0;
-  double distance_r2 = 0.0;
-  bool foundBetterCorner = 0;
+  std::vector<cv::Point2f> tmp_line_points(2);
+  std::vector<cv::Point2f> corner_line_points(2);
+  double angle_min = 360.0;
+  double angle_max = 0.0;
+  bool ransac_success = false;
   bool newCorner = 0;
-  bool lineValues = 0;
-  obvious::Matrix hist_tmp(2, 2);
-  bool getNewMirror = false;
 
-//	cout << "----------------Fkt checkMirrorHistory----------------" << endl;
-//	cout << "New corner points to check:" << endl;
-//	cout << "corner 1: " << (corner_points)(0,0) <<  "/" << (corner_points)(0,1) << endl;
-//	cout << "corner 2: " << (corner_points)(1,0) <<  "/" << (corner_points)(1,1) << endl;
-//	cout << endl;
-//
-//	cout << " This is old history -> size = " << historysize << endl;
-//	for(int i=0; i<historysize; i++)
-//	{
-//			history[i]->print();
-//	}
-//	cout << endl;
-//	cout << endl;
-
-  for(int i = 0; i < historysize; i++)
+  /*
+   * Check amount of points in mirror_pointsHistory
+   * create a temporary list of points
+   */
+  int points = 0;
+  for(int i=0; i < (counter_points); i++)
   {
-    //cout << "check history -> " << i << endl;
-    // if reach last point in history stop searching
-    if(((*history[i])(0, 0) != 0) && ((*history[i])(0, 0) != 0))
-    {
-      distance_r1 = sqrt(pow((corner_points(0, 0) - (*history[i])(0, 0)), 2.0)
-          + pow((corner_points(0, 1) - (*history[i])(0, 1)), 2.0));
-      distance_r2 = sqrt(pow((corner_points(1, 0) - (*history[i])(1, 0)), 2.0)
-          + pow((corner_points(1, 1) - (*history[i])(1, 1)), 2.0));
+    points += mirror_pointsHistory[i]->getRows();
+  }
+  double* data = new double[points,points];
 
-      //	cout << "T hist:" << endl;
-//			//	T_history[i]->print();
-//				cout << "hist 1: " << (*history[i])(0,0) <<  "/" << (*history[i])(0,1) << " - " << distance_r1 << endl;
-//				cout << "hist 2: " << (*history[i])(1,0) <<  "/" << (*history[i])(1,1) << " - " << distance_r2 <<  endl;
-      if((distance_r1 > th_new_mirror) and (distance_r2 > th_new_mirror))
+  std::vector<cv::Point2f> tmp_points(points);            // includes all points of miror_pointsHistory as cv-point (x,y)
+  vector<bool*> mask_line_points(1);
+  mask_line_points[0] = new bool[points];
+  double* angle = new double[points];
+  int m= 0;
+
+  /*
+   * copy mirror_pointsHistory points int cv-tmp_points (x,y)
+   */
+  for(int i=0; i < counter_points; i++)
+  {
+    //get one line in mirror_pointsHistory
+    mirror_pointsHistory[i]->getData(data);
+    // get amount of points in line and copy to tmp_points
+    for(int j=0; j < mirror_pointsHistory[i]->getRows(); j++)
+    {
+      if((data[i,2*j] != 0) or (data[i,2*j+1] != 0))
       {
-        // points are to far of history points away, if not found later => add a new Mirror;
-        cout << "New corners to far from history" << endl;
-        getNewMirror = true;
+        tmp_points[m].x = data[i,2*j];
+        tmp_points[m].y = data[i,2*j+1];
+        m++;
+      }
+    }
+  }
+
+  /*
+   * Create RANSAC to search for multible points
+   */
+  ransac_success = ransac2D_multi(tmp_points, tmp_line_points, ransac_points2fit, ransac_iterations, ransac_threshold, mask_line_points);
+
+  if(ransac_success)
+  {
+    /*
+     * check if line_points are already in the corner list
+     */
+    for(int l = 0; l < (tmp_line_points.size()/2); l++)
+    {
+      obvious::Matrix* tmp_line_point = new obvious::Matrix(2,2);
+      if(counter_corners == 0)
+      {
+        newCorner = 1;
       }
       else
       {
-        // check if mirror corners need update and update
- //       cout << "Check to update old history" << endl;
-        hist_tmp = *history[i];
-//							cout << "This goes in" << endl;
-//							hist_tmp->print();
-//							cout << endl;
-        foundBetterCorner = checkPointToUpdate(&hist_tmp, corner_points, th_mirrorline);
-
-//						  cout << "History after: " << endl;
-//						   hist_tmp.print();
-
-//						  for(int i=0; i < mirror_count; i++)
-//						  {
-//							  hist[i]->print();
-//						  }
-
-        if(foundBetterCorner)
+        // check if corners already exist
+        bool* mask_new_line_points = new bool[tmp_line_points.size()/2];
+        newCorner = 1;
+        (*tmp_line_point)(0,0) =  tmp_line_points[2*l].x;
+        (*tmp_line_point)(0,1) =  tmp_line_points[2*l].y;
+        (*tmp_line_point)(1,0) =  tmp_line_points[2*l+1].x;
+        (*tmp_line_point)(1,1) =  tmp_line_points[2*l+1].y;
+        for(int j=0; j < counter_corners; j++)
         {
-//          cout << "old point" << endl;
-//          cout << (*history[i])(0,0) << "/" << (*history[i])(0,1) << endl;
-//          cout << (*history[i])(1,0) << "/" << (*history[i])(1,1) << endl;
-//
-//          cout << endl;
-//          cout << "new point" << endl;
-//          cout << hist_tmp(0,0) << "/" << hist_tmp(0,1) << endl;
-//          cout << hist_tmp(1,0) << "/" << hist_tmp(1,1) << endl;
-
-          *history[i] = hist_tmp;
-//
-//          history[i](0,0) = hist_tmp(0,0);
-//          history[i](0,1) = hist_tmp(0,1);
-//          history[i](1,0) = hist_tmp(1,0);
-//          history[i](1,1) = hist_tmp(1,1);
-//          cout << "Update done" << endl;
-//          history[i]->print();
-//          cout << endl;
-
-
-          //T_history[0] = T_corner_points;
-
-//									cout << "this comes out" << endl;
-//									hist_tmp->print();
-//									cout << endl;
-//									history[i]->print();
-//									cout << endl;
-//									cout << endl;
-
-          getNewMirror = false;
-          i = historysize;
+          if(!checkPointToUpdate(cornerHistory[j],*tmp_line_point, th_mirrorline))
+          {
+            newCorner = 0;
+          }
         }
+       }
+
+      // if new corner, then check outer areas
+      if(newCorner)
+      {
+        std::vector<cv::Point2f> tmp_corner(2);
+        tmp_corner[1].x = tmp_line_points[2*l].x;
+        tmp_corner[1].y = tmp_line_points[2*l].y;
+        tmp_corner[0].x = tmp_line_points[2*l+1].x;
+        tmp_corner[0].y = tmp_line_points[2*l+1].y;
+
+        getOuterLinePoints2(tmp_points, tmp_corner, corner_line_points, mask_line_points[l], th_mirrorline);
+
+        obvious::Matrix* new_corner = new obvious::Matrix(2,2);
+
+        (*new_corner)(0,0) =  corner_line_points[0].x;
+        (*new_corner)(0,1) =  corner_line_points[0].y;
+        (*new_corner)(1,0) =  corner_line_points[1].x;
+        (*new_corner)(1,1) =  corner_line_points[1].y;
+
+         // add to history
+         cornerHistory[counter_corners] = new_corner;
+         objectIdentificationResult[counter_corners] = 3;        // Set as a mirror
+         counter_corners++;
       }
     }
-    else
-    {
-      // end search, because end of history;
-      //	cout << "reach end of history -> put a new mirror in" << endl;
-      getNewMirror = true;
-      i = historysize;
-    }
-  }
-
-  if(getNewMirror)
-  {
-    // new mirror
-    cout << "Write a new mirror to the history" << endl;
-
-    history[historysize] = &corner_points;
-    T_history[historysize] = &T_corner_points;
-    historysize++;
-
-    //cout << "The new mirror nr is " << historysize << endl;
-//		for(int i=0; i<historysize; i++)
-//		{
-//			history[i]->print();
-//		}
-//		cout << endl;
-
-    newCorner = 1;
-  }
-
- // cout << "------------------End Fkt checkMirrorHistory_2----------------" << endl;
-
-  if(foundBetterCorner or newCorner)
-    return true;
-  else
-    return false;
-}
-
-bool checkPointToUpdate(obvious::Matrix* history, obvious::Matrix& corner_points, double th_mirrorline)
-{
-//  cout << "-------------------------"<< endl;
-//  cout << "checkPointToUpdate"<< endl;
-  double d_cpoint1toLine = 0.0;
-  double d_cpoint2toLine = 0.0;
-  double d_cpoint2ToHist1 = 0.0;						// distance between corner point 1 to history corner 2
-  double d_cpoint1ToHist2 = 0.0;						// distance between corner point 2 to history corner 1
-  double d_hist = 0.0;											// distance between history corners
-
-  obvious::Matrix cpoint_1(1, 2);
-  obvious::Matrix cpoint_2(1, 2);
-
-  cpoint_1(0, 0) = corner_points(0, 0);
-  cpoint_1(0, 1) = corner_points(0, 1);
-  cpoint_2(0, 0) = corner_points(1, 0);
-  cpoint_2(0, 1) = corner_points(1, 1);
-
-  obvious::Matrix hpoint_1(1, 2);
-  obvious::Matrix hpoint_2(1, 2);
-
-  hpoint_1(0, 0) = (*history)(0, 0);
-  hpoint_1(0, 1) = (*history)(0, 1);
-  hpoint_2(0, 0) = (*history)(1, 0);
-  hpoint_2(0, 1) = (*history)(1, 1);
-
-  // calculate distance between new point and line
-  d_cpoint1toLine = calcDistToLine(cpoint_1, *history);
-  d_cpoint2toLine = calcDistToLine(cpoint_2, *history);
-
-//    cout << "history" << endl;
-//    history->print();
-//    cout << "New corner" << endl;
-//    corner_points.print();
-//  cout << "points 1/2 to line" << d_cpoint1toLine << "/" << d_cpoint2toLine << endl;
-  if((d_cpoint1toLine < th_mirrorline) && (d_cpoint2toLine < th_mirrorline))
-  {
-    // check if corner point are further outside
-    // if -> update corner/s of mirror line
-    d_cpoint1ToHist2 = calcDistOfLine(cpoint_1, hpoint_2);
-    d_cpoint2ToHist1 = calcDistOfLine(cpoint_2, hpoint_1);
-    d_hist = calcDistOfLine(hpoint_1, hpoint_2);
-    // cout << " d_p1_2h2/d_p2_2h1/p_hist " << d_cpoint1ToHist2 << "/" << d_cpoint2ToHist1 << "/" << d_hist << endl;
-
-    //cout << "Dist: " << d_hist << "/" << d_cpoint1ToHist2 << "/" << d_cpoint2ToHist1 << endl;
-    if(d_cpoint1ToHist2 < d_hist)
-    {
-      (*history)(0, 0) = cpoint_1(0, 1);
-      (*history)(0, 1) = cpoint_1(0, 1);
-    }
-
-    if(d_cpoint2ToHist1 > d_hist)
-    {
-      (*history)(1, 0) = cpoint_2(0, 1);
-      (*history)(1, 1) = cpoint_2(0, 1);
-    }
-//    cout << "updated points" << endl;
-//    history->print();
-//    cout << "CheckPointToUpdate" << endl;
-//    cout << "-----------------------" << endl;
     return 1;
   }
-
   return 0;
 }
 
-void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double th_mirrorline, double th_angleThreshold)
+void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double th_mirrorline, double th_angleThreshold, int object_type)
 {
-   //see book 05/19/15
    /*
     * point values
     */
@@ -849,7 +941,6 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
 
    object_mask = sensor->getRealMeasurementTypeID();
    sensor->dataToCartesianVectorMask(data, data_validmask);
-
    for(int i = 0; i < size; i++)
    {
      (*data_matrix)(i, 0) = data[2 * i];
@@ -861,19 +952,14 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
    *moved_data_matrix = data_matrix->createTransform(*sensor_position);
 
    // points to create the intersection line
-   // point 1 = sensor position (recalculation see book 06/01/15)
+   // point 1 = sensor position
    // point 2 = data point i
    if(!((*sensor_position)(1,0) == (*sensor_position)(1,1)))
    {
-//     (*intersectionLinePoints)(0,1) = ((*sensor_position)(1,2) * (*sensor_position)(0,0))
-//         - ((*sensor_position)(0,2) * (*sensor_position)(1,0));
-//     (*intersectionLinePoints)(0,0) = ((*sensor_position)(0,2) / (*sensor_position)(0,0))
-//         + (((*sensor_position)(1,0) / (*sensor_position)(0,0)) * (*intersectionLinePoints)(0,1));
      (*intersectionLinePoints)(0,0) = (*sensor_position)(0,2);
      (*intersectionLinePoints)(0,1) = (*sensor_position)(1,2);
      (*origin)(0, 0) = (*intersectionLinePoints)(0,0);
      (*origin)(0, 1) = (*intersectionLinePoints)(0,1);
-    // origin->print();
    }
    else
    {
@@ -891,8 +977,6 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
      {
        angle_corner_1 = getAngle(*origin, *corner_1);
        angle_corner_2 = getAngle(*origin, *corner_2);
-       // Check the shorter distance between the two angles
-       // see book 28.07.
        if((angle_corner_2 > angle_corner_1) and ((angle_corner_2 - angle_corner_1) < 180))
        {
          angleCase = 0;
@@ -916,7 +1000,7 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
        cout << __PRETTY_FUNCTION__ << "cleanScan: angle corners division error" << endl;
        return;
      }
-     if((lineValues) && (abs(angle_corner_2 - angle_corner_1) >= _th_openingAnglePrefilter))
+     if((lineValues) && (abs(angle_corner_2 - angle_corner_1) >= th_angleThreshold))
      {
        for(int i = 0; i < size; i++)
        {
@@ -973,11 +1057,11 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
                          {
                            if(d_point < (d_intersection + th_mirrorline))
                            {
-                             object_mask[i] = 1; // mirror
+                             object_mask[i] = object_type; // mirror
                            }
                            else
                            {
-                             object_mask[i] = 2; // error
+                             object_mask[i] = object_type+1; // error
                            }
                          }
                        }
@@ -993,11 +1077,11 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
                          {
                            if(d_point < (d_intersection + th_mirrorline))
                            {
-                             object_mask[i] = 1; // mirror
+                             object_mask[i] = object_type; // mirror
                            }
                            else
                            {
-                             object_mask[i] = 2; // error
+                             object_mask[i] = object_type+1; // error
                            }
                          }
                        }
@@ -1013,11 +1097,11 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
                          {
                            if(d_point < (d_intersection + th_mirrorline))
                            {
-                             object_mask[i] = 1; // mirror
+                             object_mask[i] = object_type; // mirror
                            }
                            else
                            {
-                             object_mask[i] = 2; // error
+                             object_mask[i] = object_type+1; // error
                            }
                          }
                        }
@@ -1033,11 +1117,11 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
                          {
                            if(d_point < (d_intersection + th_mirrorline))
                            {
-                             object_mask[i] = 1; // mirror
+                             object_mask[i] = object_type; // mirror
                            }
                            else
                            {
-                             object_mask[i] = 2; // error
+                             object_mask[i] = object_type+1; // error
                            }
                          }
                        }
@@ -1045,7 +1129,6 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
                      break;
                  }
              }
-//                 }
              else
              {
                cout << __PRETTY_FUNCTION__ << "cleanScan: angle_point division error" << endl;
@@ -1071,118 +1154,88 @@ void cleanScan(obvious::Matrix& corners, obvious::SensorPolar2D* sensor, double 
   delete corner_2;
 }
 
-double getAngle(obvious::Matrix& origin, obvious::Matrix& point)
-{
-  double angle = 0;
-  double delta_x = (point)(0,0) - (origin)(0,0);
-  double delta_y = (point)(0,1) - (origin)(0,1);
-  double delta_hyp = sqrt(pow(delta_x, 2.0) + pow(delta_y, 2.0));
-
-  // number of quadrant
-  int quadrant = 0;
-
-  if(delta_hyp > 0)
-  {
-    angle = acos(delta_x / delta_hyp)*180/M_PI;
-
-    if((delta_x > 0) && (delta_y > 0))
-    {
-      quadrant = 0;
-    }
-    else if((delta_x < 0) && (delta_y > 0))
-    {
-      quadrant = 1;
-    }
-    else if((delta_x < 0) && (delta_y < 0))
-    {
-      angle = 3;
-      angle = 270 - angle;
-    }
-    else if((delta_x > 0) && (delta_y < 0))
-    {
-      quadrant = 4;
-      angle = 360- angle;
-    }
-    else
-      cout << __PRETTY_FUNCTION__ << "error when calculating angle" << endl;
-  }
-
-  return angle;
-}
-
-bool checkDirection(obvious::Matrix* origin, obvious::Matrix* point_1, obvious::Matrix *point_2)
+bool checkMirrorHistory(obvious::Matrix& corner_points, obvious::Matrix& T_corner_points, std::vector<obvious::Matrix*>& history, std::vector<
+    obvious::Matrix*>& T_history, double th_new_mirror, double th_mirrorline, unsigned int& historysize)
 {
   /*
-   * same direction if,
-   * 1. x1 and x2 are both pos or neg
-   * and
-   * 2. y1 and y2 are both pos or neg
-   *
+   * check for points at origin or with NAN
    */
-  if(((((*point_1)(0,0) - (*origin)(0,0)) > 0 && ((*point_2)(0,0) - (*origin)(0,0)) > 0) and (((*point_1)(0,1) - (*origin)(0,1)) > 0 && ((*point_2)(0,1) - (*origin)(0,1)) > 0)) or
-     ((((*point_1)(0,0) - (*origin)(0,0)) > 0 && ((*point_2)(0,0) - (*origin)(0,0)) > 0) and (((*point_1)(0,1) - (*origin)(0,1)) < 0 && ((*point_2)(0,1) - (*origin)(0,1)) < 0)) or
-     ((((*point_1)(0,0) - (*origin)(0,0)) < 0 && ((*point_2)(0,0) - (*origin)(0,0)) < 0) and (((*point_1)(0,1) - (*origin)(0,1)) > 0 && ((*point_2)(0,1) - (*origin)(0,1)) > 0)) or
-     ((((*point_1)(0,0) - (*origin)(0,0)) < 0 && ((*point_2)(0,0) - (*origin)(0,0)) < 0) and (((*point_1)(0,1) - (*origin)(0,1)) < 0 && ((*point_2)(0,1) - (*origin)(0,1)) < 0)))
-  {
-    return true;
-  }
-  else
-  {
-    return false;
-  }
-}
-
-double calcDistToLine(obvious::Matrix& point, obvious::Matrix& corners)
-{
-  double distance = NAN;
-
-  float t_exist = 0.0;
-  float m_exist = 0.0;
-  bool lineValues = false;
-
-  float m_intersection = 0;
-  float t_intersection = 0;
-  obvious::Matrix* intersection = new obvious::Matrix(1, 2);
-  bool intersectionValues = false;
-
-  lineValues = calcLineValues(corners, t_exist, m_exist);
-  if(lineValues and (m_exist != 0))
-  {
-    // calculate intersection point
-    m_intersection = -1 / m_exist;
-    t_intersection = (point)(0, 1) - m_intersection * (point)(0, 0);
-
-    (*intersection)(0, 0) = (t_exist - t_intersection) / (m_intersection - m_exist);
-    (*intersection)(0, 1) = m_intersection * ((*intersection)(0, 0)) + t_intersection;
-
-    // calculate distance
-    distance = calcDistOfLine(*intersection, point);
-  }
-
-  delete intersection;
-
-  return distance;
-}
-
-double calcDistOfLine(obvious::Matrix& point1, obvious::Matrix& point2)
-{
-  return sqrt(pow(((point2)(0, 0) - (point1)(0, 0)), 2.0) + pow(((point2)(0, 1) - (point1)(0, 1)), 2.0));
-}
-
-bool calcLineValues(obvious::Matrix& points, float& t, float& m)
-{
-  if((((points)(1, 0)) - ((points)(0, 0))) != 0)
-  {
-    m = ((points)(1, 1) - (points)(0, 1)) / ((points)(1, 0) - (points)(0, 0));
-    t = (points)(1, 1) - m * (points)(1, 0);
-
-    return 1;
-  }
-  else
-  {
+  if(((corner_points)(0, 0) == 0) && ((corner_points)(0, 1) == 0))
     return 0;
+  if(((corner_points)(1, 0) == 0) && ((corner_points)(1, 1) == 0))
+    return 0;
+  if(isnan((corner_points)(1, 0)) && isnan((corner_points)(1, 1)))
+    return 0;
+  if(isnan((corner_points)(1, 0)) && isnan((corner_points)(1, 1)))
+    return 0;
+
+  // check history for similar mirror
+  double distance_r1 = 0.0;
+  double distance_r2 = 0.0;
+  bool foundBetterCorner = 0;
+  bool newCorner = 0;
+  bool lineValues = 0;
+  obvious::Matrix hist_tmp(2, 2);
+  bool getNewMirror = false;
+
+  for(int i = 0; i < historysize; i++)
+  {
+    //cout << "check history -> " << i << endl;
+    // if reach last point in history stop searching
+    if(((*history[i])(0, 0) != 0) && ((*history[i])(0, 0) != 0))
+    {
+      distance_r1 = sqrt(pow((corner_points(0, 0) - (*history[i])(0, 0)), 2.0)
+          + pow((corner_points(0, 1) - (*history[i])(0, 1)), 2.0));
+      distance_r2 = sqrt(pow((corner_points(1, 0) - (*history[i])(1, 0)), 2.0)
+          + pow((corner_points(1, 1) - (*history[i])(1, 1)), 2.0));
+
+      if((distance_r1 > th_new_mirror) and (distance_r2 > th_new_mirror))
+      {
+        // points are to far of history points away, if not found later => add a new Mirror;
+        cout << "New corners to far from history" << endl;
+        getNewMirror = true;
+      }
+      else
+      {
+        // check if mirror corners need update and update
+        hist_tmp = *history[i];
+        foundBetterCorner = checkPointToUpdate(&hist_tmp, corner_points, th_mirrorline);
+
+        if(foundBetterCorner)
+        {
+          *history[i] = hist_tmp;
+
+          getNewMirror = false;
+          i = historysize;
+        }
+      }
+    }
+    else
+    {
+      // end search, because end of history;
+      getNewMirror = true;
+      i = historysize;
+    }
   }
+
+  if(getNewMirror)
+  {
+    // new mirror
+    cout << "Write a new mirror to the history" << endl;
+
+    history[historysize] = &corner_points;
+    T_history[historysize] = &T_corner_points;
+    historysize++;
+
+    newCorner = 1;
+  }
+
+  if(foundBetterCorner or newCorner)
+    return true;
+  else
+    return false;
 }
+
 
 /*
  * Init
@@ -1191,8 +1244,8 @@ void init()
 {
   // config marker
   // POINTS markers use x and y scale for width/height respectively
-  _marker_points.scale.x = 0.05;
-  _marker_points.scale.y = 0.05;
+  _marker_points.scale.x = 0.1;
+  _marker_points.scale.y = 0.1;
   // Points are light blue
   _marker_points.color.r = 0.0;
   _marker_points.color.g = 1.0;
@@ -1206,6 +1259,7 @@ void init()
   _marker_line_strip.color.a = 1.0;
 
   ROS_INFO("Init mirror postfilter");
+
 }
 
 int main(int argc, char **argv)
@@ -1219,23 +1273,27 @@ int main(int argc, char **argv)
   // Parameters for launch file
   std::string sub_sensor;
   std::string sub_maskScan;
-  std::string sub_pose;
+  //std::string sub_pose;
 
   std::string sub_activatePub;
 
   std::string pub_scan;
   std::string pub_error;
   std::string pub_mirror;
+  std::string pub_transparent;
+  std::string pub_additional;
+
   std::string pub_marker;
   double dVar = 0;
 
   nh_sub.param < std::string > ("sub_maskScan", sub_maskScan, "maskScan");
-  nh_sub.param < std::string > ("sub_pose", sub_pose, "pose");
   nh_sub.param < std::string > ("sub_activatePub", sub_activatePub, "activatePub");
 
   nh_pub.param < std::string > ("pub_scan", pub_scan, "scan_corrected");
   nh_pub.param < std::string > ("pub_error", pub_error, "scan_error");
   nh_pub.param < std::string > ("pub_mirror", pub_mirror, "mirror_empty");
+  nh_pub.param < std::string > ("pub_transparent", pub_transparent, "mirror_transparent");
+  nh_pub.param < std::string > ("pub_additionalPoints", pub_additional, "additional_scan_points");
 
   nh_pub.param < std::string > ("pub_marker", pub_marker, "marker");              				 // maker to show in rviz
 
@@ -1248,6 +1306,27 @@ int main(int argc, char **argv)
    nh_pub.param<double>("thres_angleThreshold", dVar, 5);                     // [°] minimal angle to check for mirror points at an incoming scan
   _th_angleThreshold = static_cast<float>(dVar);
 
+  // Variables for icp
+  nh_pub.param<double>("thres_MinPointsICP", dVar, 100);                     // minimal amount of points to check with ICP for reflection
+  _th_MinPointsForICP = static_cast<float>(dVar);
+  nh_pub.param<double>("thres_MaxDistICPTrans", dVar, 0.1);                  // [m] maximal difference in distance between Transformations to identify as the same reflection
+  _th_maxDiffDistICPTrans = static_cast<float>(dVar);
+  nh_pub.param<double>("thres_MaxAngleICPTrans", dVar, 5);                   // [°] maximal difference between in angle Transformations to identify as the same reflection
+  _th_maxDiffAngleICPTrans = static_cast<float>(dVar);
+
+  // Variables for normalized intensity
+  nh_pub.param<double>("normed_white_Intensity", dVar, 10000);                   // value of intensity value of white paper at 1m
+  _norm_white_intensity = static_cast<float>(dVar);
+
+  // Variables for Phong curve
+  nh_pub.param<double>("max_Intensity", dVar, 60000);                     // maximal intensity Value
+  _max_intensityValue = static_cast<float>(dVar);
+  nh_pub.param<double>("thres_phongSpreding", dVar, 0.1);                 // +-0.1 = +-10%, max. distance between two intensity values of points next to each other
+  _th_phongSpreding = static_cast<float>(dVar);
+  nh_pub.param<double>("thres_phongFactor", dVar, 0.8);                   // [0.8 = 80%] switching factor to identify mirror or glass
+  _th_phongFactor = static_cast<float>(dVar);
+
+
   nh_pub.param<double>("min_range", dVar, 0.01);                        // [m]
   _minRange = static_cast<float>(dVar);
   nh_pub.param<double>("max_range", dVar, 30);                          // [m]
@@ -1255,38 +1334,80 @@ int main(int argc, char **argv)
    nh_pub.param<double>("low_reflectivity_range", dVar, 2.0);           //
   _lowReflectivityRange = static_cast<float>(dVar);
 
+  nh_sub.param<double>("ransac_threshold",                          dVar,       0.05);                      // Parameter for RANSAC
+  _ransac_threshold = static_cast<float>(dVar);
+  nh_sub.param<int>("ransac_iterations",                _ransac_iterations,        100);
+  nh_sub.param<int>("ransac_points2fit",                _ransac_points2fit,        20);
+
   // initialize subscriber
   ros::Subscriber sub1 = nh_sub.subscribe(sub_maskScan, 2, subscribermaskScan);
-  ros::Subscriber sub2 = nh_sub.subscribe(sub_pose, 2, subscriberPose);
   ros::Subscriber sub3 = nh_sub.subscribe(sub_activatePub, 2, subscriberActivatePub);
 
   // initialize publisher
   _pub_scan = nh_pub.advertise<sensor_msgs::LaserScan>(pub_scan, 1);
   _pub_error = nh_pub.advertise<sensor_msgs::LaserScan>(pub_error, 1);
-
+  _pub_mirror = nh_pub.advertise<sensor_msgs::LaserScan>(pub_mirror, 1);
+  _pub_transparent = nh_pub.advertise<sensor_msgs::LaserScan>(pub_transparent, 1);
   _pub_marker = nh_pub.advertise<visualization_msgs::Marker>(pub_marker, 1);
+  _pub_additional = nh_pub.advertise<ohm_mirror_detector::ohm_poseLaser_msgs>(pub_additional, 1);
+
+  _transformListener = new (tf::TransformListener);
 
   init();
 
-  ros::Rate r(25);
+  bool corner_points = false;
+  bool checkNewCorners = false;
+  ros::Rate r(50);
 
   while(ros::ok())
   {
+    /*
+     * copy new mirror data into the mirror history
+     */
     if(_new_mirror)
     {
-      if(_mirrorHistoryCounter < 45)
-      {
-        postFiltering(_sensorHistory, _mirrorHistory, _mirrorHistory_T, _sensorDataCounter, _mirrorHistoryCounter);
-      }
+       buildHistory(_sensorHistory, _sensorHistory2, _mirrorHistory1, _mirrorHistory2, _mirrorHistory_T, _sensorDataCounter, _mirrorHistoryCounter, _mirrorHistoryIntens1, _mirrorHistoryIntens2);
+       checkNewCorners = true;
     }
 
     if(_publishOn)
     {
+      /*
+       * check for mirror corners, if
+       * - no corner_points
+       * - new mirror points appeared after the corners already had calculated
+       */
+      if((!corner_points) && checkNewCorners)
+      {
+        corner_points = getCornerPoints2(_mirrorHistory1, _cornerHistory, _mirrorHistoryCounter, _mirrorCornerCounter, _ransac_points2fit, _ransac_iterations, _ransac_threshold, _th_mirrorline, _corner_object_type);
+
+        identifyReflectionType(_sensorHistory, _sensorHistory2, _sensorDataCounter, _mirrorHistoryIntens1, _mirrorHistoryIntens2, _mirrorHistory1, _mirrorHistory2, _mirrorHistoryCounter, _mirrorHistory_T, _cornerHistory, _mirrorCornerCounter, _th_mirrorline, _th_angleThreshold, _th_MinPointsForICP, _th_maxDiffDistICPTrans, _th_maxDiffAngleICPTrans, _norm_white_intensity, _max_intensityValue, _th_phongSpreding, _th_phongFactor, _corner_object_type);
+
+        checkNewCorners = false;
+      }
+
+      /*
+       * publish cleaned scans
+       */
       if(historynr < _sensorDataCounter)
       {
-        publisherFuncScan(_sensorHistory, _sensorHistory2, historynr);
+        /*
+         * if publisherFuncScan = 1 => The scan has been send.
+         * if publisherFuncScan = 0 => There was a mirror or transparent object -> Have to send the second part of the scan.
+         */
+        publisherFuncScan(_sensorHistory, _sensorHistory2, _cornerHistory, historynr, _mirrorCornerCounter, _corner_object_type);
         historynr++;
       }
+    }
+
+    if(_mirrorHistory1.size() == _mirrorHistoryCounter)
+    {
+      _mirrorHistory1.resize(_mirrorHistoryCounter + newContainerElements);
+      _mirrorHistory2.resize(_mirrorHistoryCounter + newContainerElements);
+      _mirrorHistory_T.resize(_mirrorHistoryCounter + newContainerElements);
+      _mirrorHistoryIntens1.resize(_mirrorHistoryCounter + newContainerElements);
+      _mirrorHistoryIntens2.resize(_mirrorHistoryCounter + newContainerElements);
+      _seq.resize(_mirrorHistoryCounter + newContainerElements);
     }
     _new_mirror = false;
 

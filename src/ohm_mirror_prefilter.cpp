@@ -6,6 +6,7 @@
 *
 */
 
+
 #include "ohm_mirror_prefilter.h"
 
 #include <ros/ros.h>
@@ -23,8 +24,13 @@
 #include "obcore/base/Time.h"
 
 #include "ransac.h"
+#include "rosfunctions.h"
 
 #include <sstream>
+
+// To write in file
+#include <iostream>
+#include <fstream>
 
 #define _USE_MATH_DEFINES
 
@@ -32,33 +38,35 @@ using std::vector;
 using namespace std;
 using namespace cv;
 
-unsigned int _scanSize = 0;
-unsigned int _sequenzNr = 0;
+unsigned int _scanSize            = 0;
+unsigned int _sequenzNr           = 0;
 
 
-bool _new_dataset_first = false;
-bool _new_dataset_last = false;
+bool _new_dataset_first           = false;
+bool _new_dataset_last            = false;
 
-float _substract_threshold_dist = 0.0;
-float _substract_threshold_int = 0.0;
-float _switchfactor_int = 0.0;
-float _switch_min_point = 10;
-bool _switch_reflectiontype = false;
-bool _multiline = false;
+float _substract_threshold_dist   = 0.0;
+float _substract_threshold_int    = 0.0;
+float _switchfactor_int           = 0.0;
+float _switch_min_point           = 10;
+bool _switch_reflectiontype       = false;
+bool _multiline                   = false;
+int _minMeasureDistance           = 23;
+int _maxMeasureDistance           = 60000;
 
-float _particlefilter_thres_dist_mirror = 0.001;
-int _particlefilter_threshold_angle = 10;       // 1 step = 0.25°
-float _particlefilter_thres_dist_affect = 0.01;
+float _particlefilter_thres_dist_mirror   = 0.001;
+int _particlefilter_threshold_angle       = 10;       // 1 step = 0.25°
+float _particlefilter_thres_dist_affect   = 0.01;
 
-int _ransac_iterations = 100;               // max. number of iterations allowed in the ransac
-float _ransac_threshold = 0.05;            // threshold value for determining when a data point fits the model
-int _ransac_points2fit = 20;                // min. number of data values required to fit the model
+int _ransac_iterations            = 100;               // max. number of iterations allowed in the ransac
+float _ransac_threshold           = 0.05;            // threshold value for determining when a data point fits the model
+int _ransac_points2fit            = 20;                // min. number of data values required to fit the model
 
 float _angle_inc;
 float _angle_diff;
-bool _ransac_success = 0;
+bool _ransac_success              = 0;
 
-float f = 0.0;
+float f                           = 0.0;
 
 sensor_msgs::LaserScan _first_scan;
 sensor_msgs::LaserScan _last_scan;
@@ -80,7 +88,6 @@ visualization_msgs::Marker _marker_points;
 visualization_msgs::Marker _marker_line_strip;
 visualization_msgs::Marker _marker_line_list;
 
-
 // ROS variables
 ros::Publisher _pub_scan;
 ros::Publisher _pub_mirror;
@@ -92,17 +99,17 @@ ros::Publisher _pub_check;
 ros::Publisher _pub_cloud;
 ros::Publisher _pub_marker;
 
-unsigned int _lifetime_marker = 1;  //ns  TODO: Not working proebably
+unsigned int _lifetime_marker = 1;  //ns  
 
 /*
  * Subscriber & Publisher
  */
 void subscriberFunc_first(const sensor_msgs::LaserScan& msg)
 {
-  if((!_new_dataset_first))
+  if((!_new_dataset_first)) 
   {
     // copy msg information
-	  writeHeader(_first_scan, msg);
+    copyHeaderScan(msg, _first_scan);
 
     _angle_inc = _first_scan.angle_increment;
     _angle_diff = msg.angle_max - msg.angle_min;
@@ -119,14 +126,18 @@ void subscriberFunc_first(const sensor_msgs::LaserScan& msg)
     {
       _new_dataset_first = true;
     }
+    /*
+     * CleanScan: filter points, which are out of Disance range
+     */
+    distanceFilter(_first_scan.ranges, _first_scan.intensities, _minMeasureDistance, _maxMeasureDistance);
   }
 }
 void subscriberFunc_last(const sensor_msgs::LaserScan& msg)
 {
-  if(!_new_dataset_last) // (_last_scan.header.seq < msg.header.seq) &&
-  {
+  if(!_new_dataset_last) 
+	{
     // copy msg information
-	  writeHeader(_last_scan, msg);
+    copyHeaderScan(msg, _last_scan);
 
     _last_scan.ranges.resize(_scanSize);
     _last_scan.intensities.resize(_scanSize);
@@ -142,6 +153,10 @@ void subscriberFunc_last(const sensor_msgs::LaserScan& msg)
     {
       _new_dataset_last = true;
     }
+    /*
+     * CleanScan: filter points, which are out of Disance range
+     */
+    distanceFilter(_last_scan.ranges, _last_scan.intensities, _minMeasureDistance, _maxMeasureDistance);
   }
 }
 
@@ -151,17 +166,19 @@ void publisherFunc(void)
   _maskLaser.header.stamp    = _first_scan.header.stamp;
   _maskLaser.header.seq      = _first_scan.header.seq;
 
-  writeHeader( _maskLaser.echo_1, _first_scan);
-  writeHeader( _maskLaser.echo_2, _first_scan);
-  writeHeader(_scan, _first_scan);
-  writeHeader(_mirror, _first_scan);
-  writeHeader(_affected_mirror, _first_scan);
-
+  copyHeaderScan(_first_scan, _maskLaser.echo_1);
+  copyHeaderScan(_first_scan, _maskLaser.echo_2);
+  copyHeaderScan(_first_scan, _scan);
+  copyHeaderScan(_first_scan, _mirror);
+  copyHeaderScan(_first_scan, _transp);
+  copyHeaderScan(_first_scan, _affected_mirror);
+  copyHeaderScan(_first_scan, _affected_transp);
+ 
   _cloud.header.frame_id = _first_scan.header.frame_id;
   _cloud.header.stamp    = _first_scan.header.stamp;
   _cloud.header.seq      = _first_scan.header.seq;
 
-  _maskLaser.echo_1.ranges.resize(_scanSize);
+   _maskLaser.echo_1.ranges.resize(_scanSize);
   _maskLaser.echo_1.intensities.resize(_scanSize);
   _maskLaser.echo_2.ranges.resize(_scanSize);
   _maskLaser.echo_2.intensities.resize(_scanSize);
@@ -174,25 +191,21 @@ void publisherFunc(void)
       _maskLaser.echo_1.ranges[i]       = _scan.ranges[i];
       _maskLaser.echo_1.intensities[i]  = _scan.intensities[i];
       _maskLaser.object_mask[i]         = 0;
-
     }
     else if(_mirror.ranges[i] != 0) // MIRROR
     {
       _maskLaser.echo_1.ranges[i]       = _mirror.ranges[i];
       _maskLaser.echo_1.intensities[i]  = _mirror.intensities[i];
-      _maskLaser.object_mask[i]         = 1;
-
-    }
-    else if(_affected_mirror.ranges[i] != 0) // ERROR_MIRROR
-    {
       _maskLaser.echo_2.ranges[i]       = _affected_mirror.ranges[i];
       _maskLaser.echo_2.intensities[i]  = _affected_mirror.intensities[i];
-      _maskLaser.object_mask[i]         = 2;
+      _maskLaser.object_mask[i]         = 1;
     }
     else if(_transp.ranges[i] != 0) // TRANSPARENT
     {
       _maskLaser.echo_1.ranges[i]       = _transp.ranges[i];
       _maskLaser.echo_1.intensities[i]  = _transp.intensities[i];
+      _maskLaser.echo_2.ranges[i]       = _affected_transp.ranges[i];
+      _maskLaser.echo_2.intensities[i]  = _affected_transp.intensities[i];
       _maskLaser.object_mask[i]         = 3;
 
     }
@@ -202,11 +215,18 @@ void publisherFunc(void)
       _maskLaser.echo_2.intensities[i]  = _affected_transp.intensities[i];
       _maskLaser.object_mask[i]         = 4;
     }
-
+    else if(_affected_mirror.ranges[i] != 0) // ERROR_MIRROR
+    {
+      _maskLaser.echo_2.ranges[i]       = _affected_mirror.ranges[i];
+      _maskLaser.echo_2.intensities[i]  = _affected_mirror.intensities[i];
+      _maskLaser.object_mask[i]         = 2;
+    }
   }
 
   _pub_scan.publish(_scan);
+  _pub_transp.publish(_transp);
   _pub_affected_mirror.publish(_affected_mirror);
+  _pub_affected_transp.publish(_affected_transp);
   _pub_mirror.publish(_mirror);
   _pub_maskScan.publish(_maskLaser);
 
@@ -275,50 +295,32 @@ void pubLineList()
 
 }
 
-void writeHeader(sensor_msgs::LaserScan& goal, const sensor_msgs::LaserScan& source)
-{
-  goal.header.frame_id = source.header.frame_id;
-  goal.header.stamp    = source.header.stamp;
-  goal.header.seq      = source.header.seq;
-  goal.angle_min       = source.angle_min;
-  goal.angle_max       = source.angle_max;
-  goal.angle_increment = source.angle_increment;
-  goal.range_min       = source.range_min;
-  goal.range_max       = source.range_max;
-  goal.scan_time       = source.scan_time;
-}
-
 /*
  * filter functions
  */
+void distanceFilter(std::vector<float>&scan, std::vector<float>& intensities, int minDist, int maxDist)
+{
+  for(int i=0; i< sizeof(scan); i++)
+  {
+    if((scan[i] < minDist) or (scan[i] > maxDist))
+    {
+      scan[i] = 0;
+      intensities[i] = 0;
+    }
+  }
+}
+
 void particleFilter(std::vector<float>& scan, std::vector<float>& intensity, float threshold)
 {
   for (unsigned int i = 0; i < (scan.size()-1); i++)
   {
-    // check if next point is still in the threshold distance, if not delete point
-    //cout << (double) abs(scan[i]-scan[i+1]) << "  " << threshold << "  ";
-//    if(abs(scan[i]-scan[i+1])!= 0)
-//    {
-//      cout << abs(scan[i]-scan[i+1]) << " ";
-//    }
-
     if(abs(scan[i]-scan[i+1]) > threshold)
     {
         scan[i] = 0.0;
         intensity[i] = 0.0;
-       //cout << "n" << endl;
     }
-//    else
-//    {
-//       _check.ranges[i] = _mirror.ranges[i];
-//       _check.intensities[i] = _mirror.intensities[i];
-//       cout << "j" << endl;
-//
-//    }
   }
-  //  cout << endl;
 }
-
 void particleFilter1(std::vector<float>& scan, std::vector<float>& intensity, float threshold_dist, int threshold_angle_steps)
 {
   /*
@@ -382,7 +384,6 @@ void mirrorVisionCone_multi(std::vector<float>& scan, std::vector<float>& intens
 
 void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_points, std::vector<cv::Point2f>& corner_points, bool* mask_linepoints)
 {
-  // Book 02/05/15
   int i = 0;
   int first_1 = 0;
   int last_1 = 0;
@@ -409,11 +410,6 @@ void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_point
       mask_linepoints[j] = false;
     }
   }
-
-  /*
-  * find corner points (book 05.02.15)
-  */
-  // loop 1:
   while(i < scan.size())
   {
     if((mask_linepoints[i]) && (scan[i] != 0.0))
@@ -424,18 +420,14 @@ void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_point
     }
     i++;
   }
-
   if(found)
   {
-    // select starting at angle for loop 2
     // first_1 + 180° or first_1 - 180°
-    //
     if(first_1 <= max_inc/2)
     {
-      i = first_1 + max_inc/2;                              // starting point of loop 2a
+      i = first_1 + max_inc/2;                              
 
-      // loop 2a:
-      first_2 = first_1;                                    // if not found another point during the 2a loop, this has to be the first point
+      first_2 = first_1;                                    
       while(i < max_inc)
       {
         if((mask_linepoints[i]) && (scan[i] != 0.0))
@@ -445,9 +437,8 @@ void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_point
         }
         i++;
       }
-      i = first_1 + max_inc/2;                              // starting point of loop 2b
+      i = first_1 + max_inc/2;                             
 
-      // loop 2b
       while(i >= first_1)
       {
         if((mask_linepoints[i]) && (scan[i] != 0.0))
@@ -460,10 +451,9 @@ void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_point
     }
     else
     {
-      // loop 2a not nessecarry, first_1 has to be the correct point
       first_2 = first_1;
 
-      i = max_inc;                              // starting point of loop 2b
+      i = max_inc;                              
       while(i > first_1)
       {
         if((mask_linepoints[i]) && (scan[i] != 0.0))
@@ -495,12 +485,15 @@ void markMirrorArea(std::vector<float> scan, std::vector<cv::Point2f> line_point
         mask_linepoints[j] = true;
       }
     }
-
+  }
+  else
+  {
+    //ROS_INFO("Error in finding Mirror plane");
   }
 }
-
 void markMirrorArea_multi(std::vector<float> scan, std::vector<cv::Point2f> line_points, std::vector<cv::Point2f>& corner_points, std::vector<bool*>& mask_linepoints)
 {
+
   if(corner_points.size() < line_points.size())
   {
     corner_points.resize(line_points.size());
@@ -551,7 +544,6 @@ void filter_echos(void)
  * Subtract scans
  */
   subtract_result = subtractScans(_first_scan, _last_scan, _scan, _mirror, _affected_mirror, _substract_threshold_dist);
-
   if(subtract_result)    // Only if true there are discrepancies in the scans
   {
     /*
@@ -565,7 +557,6 @@ void filter_echos(void)
       * find mirror line, get the corner points of the line and delete points at _mirror.ranges and _affected_mirror.ranges, which are not behind the mirror
       */
       linefit_success = findMirrorLine(_mirror.ranges, _mirror_line_points, mask_line_points, _ransac_threshold);
-
       if(linefit_success)
       {
         /*
@@ -579,7 +570,6 @@ void filter_echos(void)
         {
           sortingScanOnLineToMirror(_scan.ranges, _scan.intensities, _affected_mirror.ranges, _affected_mirror.intensities, mask_line_points[0], _mirror_line_points, _ransac_threshold);
         }
-
         /*
          * check scan for remaining affected points
          * (points, which are in the vision cone and behind the mirror line)
@@ -629,6 +619,11 @@ void filter_echos(void)
          * clean up affected from single points
          */
          particleFilter(_affected_mirror.ranges, _affected_mirror.intensities, _particlefilter_thres_dist_affect);
+
+         if(_switch_reflectiontype)
+         {
+           analyzeReflectionType(_mirror, _affected_mirror, _transp, _affected_transp, _substract_threshold_int);
+         }
       }
       else
       {
@@ -640,7 +635,6 @@ void filter_echos(void)
 
          cleanUpScan(_mirror.intensities);
          cleanUpScan(_affected_mirror.intensities);
-
       }
   }
   else
@@ -674,6 +668,7 @@ bool subtractScans(sensor_msgs::LaserScan& first, sensor_msgs::LaserScan& last, 
       mirror.intensities[i]    = first.intensities[i];
       affected.ranges[i]       = last.ranges[i];
       affected.intensities[i]  = last.intensities[i];
+
       result = 1;
     }
   }
@@ -705,8 +700,10 @@ bool findMirrorLine(std::vector<float> scan, std::vector<cv::Point2f>& corner_li
   }
   else
   {
+    //obvious::Time start_time = obvious::Time::now();
     ransac_success = ransac2D(tmp_scan, tmp_line_points, _ransac_points2fit, _ransac_iterations, threshold, mask_line_points[0]);
   }
+
 
   if(ransac_success)
   {
@@ -721,7 +718,6 @@ bool findMirrorLine(std::vector<float> scan, std::vector<cv::Point2f>& corner_li
     {
       markMirrorArea(scan, tmp_line_points, corner_line_points, mask_line_points[0]);
     }
-
     ransac_success = false;
     return 1;
   }
@@ -733,6 +729,41 @@ bool findMirrorLine(std::vector<float> scan, std::vector<cv::Point2f>& corner_li
   delete [] point_1;
   delete [] point_2;
 
+}
+
+
+void analyzeReflectionType(sensor_msgs::LaserScan& mirror, sensor_msgs::LaserScan& affected_mirror, sensor_msgs::LaserScan& transp, sensor_msgs::LaserScan& affected_transp, float thres_int)
+{
+  float tmp_diff = 0;
+  float tmp_sum_aff = 0;
+  float tmp_sum_mirror = 0;
+  float tmp_div = 0;
+
+  int amount_trans = 0;
+  int amount_total = 0;
+  bool transparent = 0;
+  bool result1 = 0;
+
+  /************************************************
+  * division of median echo 1 and echo 2
+  ************************************************/
+  for (unsigned int i = 0; i < _scanSize; i++)
+  {
+    if((mirror.ranges[i] > 0.0) && (affected_mirror.ranges[i] > 0.0))
+    {
+      tmp_sum_aff += affected_mirror.intensities[i];
+      tmp_sum_mirror += mirror.intensities[i];
+    }
+  }
+  tmp_div = tmp_sum_aff / tmp_sum_mirror;
+  if(tmp_div > 3)
+  {
+    transparent = true;
+  }
+  else
+  {
+    transparent = false;
+  }
 }
 
 void sortingScanOnLineToMirror(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& mirror, std::vector<float>& m_intens, bool* mask_linepoints, std::vector<cv::Point2f> line_points, float threshold)
@@ -788,7 +819,6 @@ void sortingScanOnLineToMirror_multi(std::vector<float>& scan, std::vector<float
 
 void sortingScanOnLineToAffected(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& affected, std::vector<float>& a_intens, bool* mask_linepoints)
 {
-
   for(unsigned int i = 0; i < scan.size(); i++)
   {
     if(mask_linepoints[i] && (scan[i] != 0))
@@ -809,8 +839,6 @@ void sortingScanOnLineToAffected_multi(std::vector<float>& scan, std::vector<flo
   }
 }
 
-
-//TODO: also intensities have to be moved
 void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_intens, std::vector<float>& recalculated_scan, std::vector<float>& rec_intens, std::vector<cv::Point2f> line_points)
 {
   float m_mirror = 0.0;             // gradient mirror line
@@ -841,8 +869,6 @@ void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_int
 
   int sizeData = scan.size();
 
-  //cout << " corner points for affected " <<  line_points[0].x << " / " << line_points[0].y << "  :  " << line_points[1].x << " / " << line_points[1].y << endl;
-
   /*
    * line for mirror: y = mx + t
    * m = (y2-y1)/(x2-x1)
@@ -852,7 +878,6 @@ void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_int
   t_mirror = line_points[1].y - m_mirror * line_points[1].x;
   m_normal = -1/m_mirror;
 
-  // vek_p_i: vektor scanner to testpoint
   /*
    * Convert from Laser::scan into xy
    */
@@ -885,7 +910,6 @@ void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_int
 
       vek_ip_i.x = vek_p_i[i].x - intersection_point_i.x;
       vek_ip_i.y = vek_p_i[i].y - intersection_point_i.y;
-
       /*
        * vek_pn_i
        *
@@ -901,6 +925,8 @@ void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_int
       vek_pn_i.x = vek_p_i[i].x - normal_point_i.x;
       vek_pn_i.y = vek_p_i[i].y - normal_point_i.y;
 
+
+
       /*
        * original point location
        */
@@ -915,6 +941,14 @@ void recalculateAffectedPoins(std::vector<float> scan, std::vector<float>& s_int
    * convert from xy into Laser::scan
    */
   convertxy2scan(tmp_recalculated, recalculated_scan, _angle_inc, _angle_diff);
+
+  /*
+   * copy intensities
+   */
+  for(int i = 0; i < sizeof(s_intens); i++)
+  {
+    rec_intens[i] = s_intens[i];
+  }
 }
 
 
@@ -994,8 +1028,10 @@ void init()
 {
   // config marker
     _mirror_line_points.resize(2);
+    // POINTS markers use x and y scale for width/height respectively
     _marker_points.scale.x = 0.05;
     _marker_points.scale.y = 0.05;
+    // LINE_STRIP/LINE_LIST markers use only the x component of scale, for the line width
     _marker_line_strip.scale.x = 0.02;
     _marker_line_list.scale.x = 0.02;
     // Points are light blue
@@ -1040,36 +1076,36 @@ int main(int argc, char **argv)
   nh_sub.param<std::string>("sub_scan_first",           sub_first,                 "first");
   nh_sub.param<std::string>("sub_scan_last",            sub_last,                  "last");
 
-  nh_sub.param<double>("substract_threshold_dist",      dVar, 1.0);                    // allowed distance between first and last scan
+  nh_sub.param<double>("substract_threshold_dist",                dVar,         1.0);                       // allowed distance between first and last scan
   _substract_threshold_dist = static_cast<float>(dVar);
-
-  nh_sub.param<double>("substract_threshold_int",       dVar, 200);                     // to check for mirror or transparent objects
+  nh_sub.param<double>("substract_threshold_int",                 dVar,         200);                       // to check for mirror or transparent objects
   _substract_threshold_int = static_cast<float>(dVar);
-  nh_sub.param<double>("switchfactor_int",              dVar, 0.6);                            // min percentage of transparent points
+  nh_sub.param<double>("switchfactor_int",                        dVar,         0.6);                       // min percentage of transparent points
   _switchfactor_int = static_cast<float>(dVar);
-  nh_sub.param<double>("switch_min_point",              dVar, 10);                             // min amount of points to differ between mirror or transparent object
+  nh_sub.param<double>("switch_min_point",                        dVar,         10);                        // min amount of points to differ between mirror or transparent object
   _switch_min_point = static_cast<float>(dVar);
-  nh_sub.param<bool>("switch_reflectiontype",           _switch_reflectiontype, true);                      // true: differentation between mirror and glas, false: every reflection is mirror
-  nh_sub.param<bool>("multiline",           _multiline, false);                               // true: recognise multiple mirror lines
-
-  nh_sub.param<double>("particlefilter_threshold_dist_mirror",     dVar,     0.05);              // allowed distance between two neighbor points
+  nh_sub.param<double>("particlefilter_threshold_dist_mirror",     dVar,        0.05);                      // allowed distance between two neighbor points
   _particlefilter_thres_dist_mirror = static_cast<float>(dVar);
-  nh_sub.param<int>("particlefilter_threshold_angle",              _particlefilter_threshold_angle,    10);                // max distance between two neighbor points
-  nh_sub.param<double>("particlefilter_threshold_dist_affected",   dVar,     0.1);              // allowed distance between two neighbor points
+  nh_sub.param<double>("particlefilter_threshold_dist_affected",   dVar,        0.1);                       // allowed distance between two neighbor points
   _particlefilter_thres_dist_affect = static_cast<float>(dVar);
-
-  nh_sub.param<double>("ransac_threshold",              dVar,         0.05);                   // Parameter for RANSAC
+  nh_sub.param<double>("ransac_threshold",                          dVar,       0.05);                      // Parameter for RANSAC
   _ransac_threshold = static_cast<float>(dVar);
+
+  nh_sub.param<int>("particlefilter_threshold_angle",   _particlefilter_threshold_angle,    10);            // max distance between two neighbor points
+  nh_sub.param<bool>("switch_reflectiontype",           _switch_reflectiontype, false);                      // true: differentation between mirror and glas, false: every reflection is mirror
+  nh_sub.param<bool>("multiline",                       _multiline, false);                                 // true: recognise multiple mirror lines
+
   nh_sub.param<int>("ransac_iterations",                _ransac_iterations,        100);
   nh_sub.param<int>("ransac_points2fit",                _ransac_points2fit,        15);
-
+  nh_sub.param<int>("minMeasureDistance",               _minMeasureDistance,        23);
+  nh_sub.param<int>("maxMeasureDistance",               _maxMeasureDistance,        60000);
 
   nh_pub.param<std::string>("pub_scan",                 pub_scan,                 "scan");                  // filtered scan
   nh_pub.param<std::string>("pub_mirror",               pub_mirror,               "mirror");                // points assigned to mirror plane
   nh_pub.param<std::string>("pub_transp",               pub_transp,               "transparent");           // points assigned to transparent plane
   nh_pub.param<std::string>("pub_affected_transp",      pub_affected_transp,      "affected transparent");  // points affected by transparent object
   nh_pub.param<std::string>("pub_affected_mirror",      pub_affected_mirror,      "affected mirror");       // points affected by mirror
-  nh_pub.param<std::string>("pub_maskScan",             pub_maskScan,             "maskScan");             // scan masked with point types
+  nh_pub.param<std::string>("pub_maskScan",             pub_maskScan,             "maskScan");              // scan masked with point types
 
   nh_pub.param<std::string>("pub_check",                pub_check,                "check");                 // publish for analyzing
   nh_pub.param<std::string>("pub_cloud",                pub_cloud,                "cloud");                 // publish for analyzing
@@ -1099,10 +1135,9 @@ int main(int argc, char **argv)
 
   while(ros::ok())
   {
-
     if(_new_dataset_first && _new_dataset_last)
     {
-       filter_echos();
+      filter_echos();
       _new_dataset_first = false;
       _new_dataset_last = false;
     }

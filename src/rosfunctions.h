@@ -32,12 +32,22 @@ void convertPath2ROS(std::vector<cv::Point3f>& coords_path, std::vector<cv::Vec4
  */
 void convertMap2ROS(std::vector<cv::Point2f>& coords, std::vector<int>& mask, cv::Vec4f& map_orient, cv::Point3f& map_pos, nav_msgs::OccupancyGrid& map);
 
-
 /*
  * converting a ros occopancy grid map to xy-data
  */
 void convertMap2xy(nav_msgs::OccupancyGrid& map, std::vector<cv::Point2f>& coords, std::vector<int>& mask);
 
+/*
+ * convert a laser scan to xy-data and sort
+ * Input:
+ * coords:            xy-coords
+ * angle_inc:         angle between two scan points (rad)
+ * size:              amount of laser scan points
+ *
+ * Output:
+ * distance:          laser scan
+ */
+void convertxy2RosSort(double* coords, double* distance, int size, double angle_inc);
 
 /*
  * convert a laser scan to xy-data
@@ -64,3 +74,4 @@ void convertROS2xy(sensor_msgs::LaserScan &scan, std::vector<cv::Point2f> &data,
 void convertxy2ROS(std::vector<cv::Point2f> &data, sensor_msgs::LaserScan &scan, float angle_increment, float scanangle);
 
 void copyHeaderScan(sensor_msgs::LaserScan scan_in, sensor_msgs::LaserScan &scan_out);
+

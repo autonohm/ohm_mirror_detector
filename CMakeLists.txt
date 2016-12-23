@@ -64,11 +64,14 @@ find_package(catkin REQUIRED COMPONENTS
 ##   * uncomment the generate_messages entry below
 ##   * add every package in MSG_DEP_SET to generate_messages(DEPENDENCIES ...)
 
+
 ## Generate messages in the 'msg' folder
 add_message_files(
   FILES
   ohm_maskLaser_msgs.msg
+  ohm_poseLaser_msgs.msg
 )
+
 
 ## Generate services in the 'srv' folder
 # add_service_files(
@@ -89,6 +92,9 @@ generate_messages(
   DEPENDENCIES
   sensor_msgs
   std_msgs
+	geometry_msgs
+	#ohm_maskLaser_msgs
+	#ohm_poseLaser_msgs 
 )
 
 ###################################
@@ -103,7 +109,7 @@ generate_messages(
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES ohm_mirror_detector
-  CATKIN_DEPENDS roscpp rospy sensor_msgs std_msgs visualization_msgs tf nav_msgs geometry_msgs ohm_maskLaser_msgs
+  CATKIN_DEPENDS roscpp rospy sensor_msgs std_msgs visualization_msgs tf nav_msgs geometry_msgs ohm_maskLaser_msgs ohm_poseLaser_msgs 
   DEPENDS system_lib
 )
 
@@ -127,9 +133,9 @@ include_directories(
 
 LINK_DIRECTORIES(
   ${PROJECT_SOURCE_DIR}/lib
-  $ENV{OBVIOUSLY_ROOT}/build/debug/obcore  
-  $ENV{OBVIOUSLY_ROOT}/build/debug/obvision
-  $ENV{OBVIOUSLY_ROOT}/build/debug/obgraphic
+  $ENV{OBVIOUSLY_ROOT}/build/release/obcore  
+  $ENV{OBVIOUSLY_ROOT}/build/release/obvision
+  $ENV{OBVIOUSLY_ROOT}/build/release/obgraphic
   ${PCL_LIBRARY_DIRS}
 )
 
@@ -139,14 +145,17 @@ SET(VISIONLIBS obvision ann flann)
 SET(OBVIOUSLIBS  obvision obcore	obgraphic)
 
 ## Declare a cpp executable
- add_executable(ohm_mirror_prefilter src/ohm_mirror_prefilter.cpp src/ransac.cpp)
- add_executable(ohm_mirror_postfilter src/ohm_mirror_postfilter.cpp src/rosfunctions.cpp)
+ add_executable(ohm_mirror_prefilter src/ohm_mirror_prefilter.cpp src/ransac.cpp src/rosfunctions.cpp)
+ add_executable(ohm_mirror_postfilter src/ohm_mirror_postfilter.cpp src/rosfunctions.cpp src/ransac.cpp src/reflectionIdentifier.cpp src/lineFunctions.cpp src/rosfunctions.cpp)
+
+ #add_executable(ohm_mirror_prefilter3D src/ohm_mirror_prefilter3D.cpp src/Scan3D.cpp src/Object3D.cpp src/planeFunctions.cpp src/rosfunctions3D.cpp)
 
 ## Add cmake target dependencies of the executable/library
 ## as an example, message headers may need to be generated before nodes
- add_dependencies(ohm_mirror_prefilter ohm_mirror_prefilter_generate_messages_cpp ransac)
- add_dependencies(ohm_mirror_postfilter ohm_mirror_postfilter_generate_messages_cpp)
+ add_dependencies(ohm_mirror_prefilter ohm_mirror_prefilter_generate_messages_cpp ransac reflectionIdentifier lineFunctions rosfunctions)
+ add_dependencies(ohm_mirror_postfilter ohm_mirror_postfilter_generate_messages_cpp ransac reflectionIdentifier lineFunctions rosfunctions)
 
+# add_dependencies(ohm_mirror_prefilter3D ohm_mirror_prefilter3D_generate_messages_cpp rosfunctions3D)
 ## Specify libraries to link a library or executable target against
  target_link_libraries(ohm_mirror_prefilter
    ${catkin_LIBRARIES}
@@ -166,6 +175,14 @@ SET(OBVIOUSLIBS  obvision obcore	obgraphic)
 		       gslcblas
 		       ${Boost_LIBRARIES}
 	)
+
+# target_link_libraries(ohm_mirror_prefilter3D
+#   ${catkin_LIBRARIES}
+#	 ${OpenCV_LIBS}
+#	 ${GRAPHICLIBS} 
+#	 ${CORELIBS} 
+#	 ${VISIONLIBS}
+# )
 #############
 ## Install ##
 #############

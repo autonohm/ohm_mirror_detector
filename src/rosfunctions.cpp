@@ -26,6 +26,7 @@ void convertPath2ROS(std::vector<cv::Point3f>& coords_path, std::vector<cv::Vec4
   {
     ros_path.poses.resize(coords_path.size());
   }
+  // copy
   for(int i=0; i < coords_path.size(); i++)
   {
     ros_path.poses[i].header.seq          = ros_path.header.seq;
@@ -50,7 +51,6 @@ void convertPath2xyz(nav_msgs::Path& ros_path, std::vector<cv::Point3f>& coords_
   {
     coords_path.resize(ros_path.poses.size());
     path_orient.resize(ros_path.poses.size());
-
   }
   // copy
   for(int i=0; i < ros_path.poses.size(); i++)
@@ -64,7 +64,6 @@ void convertPath2xyz(nav_msgs::Path& ros_path, std::vector<cv::Point3f>& coords_
     path_orient[i].val[2] = ros_path.poses[i].pose.orientation.z;
     path_orient[i].val[3] = ros_path.poses[i].pose.orientation.w;
   }
-
 }
 
 void convertMap2ROS(std::vector<cv::Point2f>& coords, std::vector<int>& mask, cv::Vec4f& map_orient, cv::Point3f& map_pos, nav_msgs::OccupancyGrid& map)
@@ -112,6 +111,48 @@ void convertMap2ROS(std::vector<cv::Point2f>& coords, std::vector<int>& mask, cv
   }
 }
 
+void convertxy2RosSort(double* coords, double* distance, int size, double angle_inc)
+{
+  for (unsigned int i = 0; i < size; i++)
+  {
+    distance[i] = 0;
+  }
+  int j = 0;
+  int max_inc = 2*M_PI / angle_inc;         // 360° = max_inc
+  double scanangle = 2*M_PI*0.75; // :360*270 = *0.75
+   // resize scan to get 360°
+  for (unsigned int i = 0; i < size; i++)
+  {
+    if(!(isnan(coords[2*i+1])))
+    {
+      if(coords[2*i] != 0.0)
+      {
+        // calculate new angle 
+        j = (atan(coords[2*i] / -coords[2*i+1]) / angle_inc);
+        if(j > max_inc)
+        {
+          j =  j - max_inc;
+        }
+        else if(j < 0)
+        {
+          j = j + max_inc;
+        }
+        if(j > 540)
+        {
+          j = j - 540;
+          distance[j] = sqrt(pow((coords[2*i+1]),2.0) + pow((coords[2*i]),2.0));
+        }
+      }
+      else
+      {
+        j = max_inc;
+        distance[j] = coords[2*i];
+      }
+
+
+    }
+  }
+}
 
 void convertMap2xy(nav_msgs::OccupancyGrid& map, std::vector<cv::Point2f>& coords, std::vector<int>& mask)
 {
@@ -137,7 +178,6 @@ void convertMap2xy(nav_msgs::OccupancyGrid& map, std::vector<cv::Point2f>& coord
       mask[j+i*width] = map.data[j+i*width];
       if((map.data[j+i*width] != -1) && map.data[j+i*width] != 0)
       {
-		  //TODO: Orientation is not used yet.
         coords[index].x = map.info.resolution * j + map.info.origin.position.x;
         coords[index].y = map.info.resolution * i + map.info.origin.position.y;
         index++;
@@ -149,7 +189,6 @@ void convertMap2xy(nav_msgs::OccupancyGrid& map, std::vector<cv::Point2f>& coord
 void convertROS2xy(sensor_msgs::LaserScan &scan, std::vector<cv::Point2f> &data, float angle_increment, float scanangle)
 {
   cv::Point2f tmp_point;
-
   for (unsigned int i = 0; i < (scan.ranges.size()); i++)
   {
     tmp_point.x = -scan.ranges[i] * sin(angle_increment*i + scanangle/2);
@@ -169,7 +208,7 @@ void convertxy2ROS(std::vector<cv::Point2f> &data, sensor_msgs::LaserScan &scan,
   {
     if(data[i].x != 0.0)
     {
-      // calculate new angle (Book 02/04/15)
+      // calculate new angle 
       j = (atan(data[i].y / data[i].x) / angle_increment) - (scanangle/6/angle_increment);
       if(j > max_inc)
       {
@@ -203,3 +242,4 @@ void copyHeaderScan(sensor_msgs::LaserScan scan_in, sensor_msgs::LaserScan &scan
 	scan_out.range_min        	= scan_in.range_min;
 	scan_out.range_max        	= scan_in.range_max;
 }
+

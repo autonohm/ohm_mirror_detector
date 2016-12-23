@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package>
   <name>ohm_mirror_detector</name>
-  <version>1.0.0</version>
+  <version>2.0.0</version>
   <description>The ohm_mirror_detector package</description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag --> 
@@ -42,6 +42,7 @@
   <buildtool_depend>catkin</buildtool_depend>
 	<build_depend>sensor_msgs</build_depend>
   <build_depend>ohm_maskLaser_msgs</build_depend> 
+  <build_depend>ohm_poseLaser_msgs</build_depend> 
   <build_depend>roscpp</build_depend>
   <build_depend>rospy</build_depend>
   <build_depend>std_msgs</build_depend>
@@ -52,6 +53,7 @@
 
   <run_depend>sensor_msgs</run_depend>
   <run_depend>ohm_maskLaser_msgs</run_depend> 
+  <run_depend>ohm_poseLaser_msgs</run_depend> 
   <run_depend>roscpp</run_depend>
   <run_depend>rospy</run_depend>
   <run_depend>std_msgs</run_depend>

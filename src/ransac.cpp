@@ -3,9 +3,6 @@
 * @author Rainer Koch
 * @date   28.01.2015
 *
-* Book 28.01.2015
-*
-*
 */
 
 
@@ -16,7 +13,8 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <sstream>
-#include<iostream>
+#include <iostream>
+#include <algorithm>
 
 using std::vector;
 using namespace cv;
@@ -24,11 +22,11 @@ using namespace std;
 
 bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int minNumToFit, int iterations, float dist_threshold, bool* mask)
 {
-  //Given:
   int good_Points             = 0;        // the number of points fitting the model
   int trailcount              = 0;        // count how many trails had been done
   int sizeData                = 0;        // amount of data points
   bool* tmp_mask = NULL;
+  int max_empty               = 20;       // max. amount of empty/not valid points between two points
 
   int idx_1                   = 0;                        // index for first sample point
   int idx_2                   = 0;                        // index for second sample point
@@ -38,7 +36,6 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
   Point2f sample_point_2;           // point 2 for model line
   sample_point_2.x            = 0.0;
   sample_point_2.y            = 0.0;
-  //bool* mask                  = NULL;
   float m                     = 0.0;                          // gradient of model
   float m_inv                 = 0.0;                      // vertical gradient to model
   float t                     = 0.0;                          // y-intercept
@@ -56,7 +53,6 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
 
 
   // Return:
-  //vector<Point2f> linePoints(2);
   Point2f goodModel1;               // good model point 1
   goodModel1.x                 = 0.0;
   goodModel1.y                 = 0.0;
@@ -75,9 +71,7 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
     return 0;
   }
   tmp_mask = new bool[data.size()];
-  //cout << "Ransac1" << endl;
 
-  //mask = new bool[sizeData];
   int emergency_stop = 0;           // stops while loop, when getting to many runs.
   while(trailcount < iterations)
   {
@@ -103,8 +97,6 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
       sample_point_1.y = data[idx_1].y;
       sample_point_2.x = data[idx_2].x;
       sample_point_2.y = data[idx_2].y;
-
-    // check if one of the sample points is at 0/0
 
       // fit model to hypothetical inlier
       // line for model: y = mx + t
@@ -150,10 +142,36 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
       d_2 = sqrt( pow((sample_point_2.x),2.0) + pow((sample_point_2.y),2.0));
       d_middle = (d_1 + d_2) / 2;
 
+      //minNumToFitModified = d_middle * minNumToFit;
       minNumToFitModified = minNumToFit;
 
+      // Max amount of "empty" points between, if more points between are not in the line then do not use the modle
+      int int_occure1 = 0;
+      int int_occure2 = 0;
+      for(int i= 0; i < sizeData; i++)
+      {
+        if(tmp_mask[i])
+        {
+          int_occure2 = int_occure1;
+          int_occure1 = i;
+        }
+      }
+
+
+      // Go through all points and check if the distance between each point is smaller than the threshold
+      // - sort them by x and y value
+      // - check max. distance between two points next to each other in x and y
+      // - if distance > thres_max_dist => points are to far away
+      double d = 0;
+
+      double thres_max_dist = 0.5;
+      bool pointsClose = true;
+      float tmp_x[good_Points];
+      float tmp_y[good_Points];
+      int m = 0;
+
       int test = 0;
-      if((good_Points > goodModel_points) && (good_Points >= minNumToFitModified))
+      if((good_Points > goodModel_points) && (good_Points >= minNumToFitModified) && (int_occure2-int_occure1 < max_empty) && pointsClose)
       {
         goodModel1.x = sample_point_1.x;
         goodModel1.y = sample_point_1.y;
@@ -188,7 +206,7 @@ bool ransac2D(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int mi
   return 0;
 }
 
-bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int minNumToFit, int iterations, float dist_threshold, vector<bool*>& mask)
+bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, int minNumToFit, int iterations, float dist_threshold, vector<bool*>&  mask)
 {
   int lines = 0;
   bool ransac_sucessful = true;
@@ -196,7 +214,6 @@ bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, 
 
   vector<Point2f> tmp_data(data.size());
   vector<Point2f> tmp_linePoints(2);
-
   bool* tmp_mask = new bool[data.size()];
   for(int i=0; i < data.size(); i++)
   {
@@ -207,6 +224,7 @@ bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, 
   while(ransac_sucessful)
   {
     ransac_sucessful = ransac2D(tmp_data, tmp_linePoints, minNumToFit, iterations, dist_threshold, tmp_mask);
+
     if(ransac_sucessful)
     {
       linefound = true;
@@ -216,6 +234,7 @@ bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, 
         mask.resize(lines+1);
         mask[lines] = new bool[tmp_data.size()];
       }
+
       linePoints[2*lines].x = tmp_linePoints[0].x;
       linePoints[2*lines].y = tmp_linePoints[0].y;
       linePoints[2*lines+1].x = tmp_linePoints[1].x;
@@ -235,5 +254,5 @@ bool ransac2D_multi(vector<cv::Point2f>& data, vector<cv::Point2f>& linePoints, 
     }
   }
   return linefound;
-
 }
+

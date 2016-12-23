@@ -15,13 +15,28 @@
 #include <opencv2/imgproc/imgproc.hpp>
 
 /*
- * _typeID
+ *
  * 0 = POINT
  * 1 = MIRROR
  * 2 = ERROR_Mirror
  * 3 = TRANSPARENT
  * 4 = ERROR_TRANSPARENT
+ * 5 = error_mirror recalculated
  */
+
+/*
+ * filter out data which are out of range
+ * Input:
+ * scan:        laser scan
+ * intensity:   intensity of laser scan
+ * minDist:     minimal measure distance (Hokuyo ELW normaly 23)
+ * maxDist:     maximal measure distance (Hokuyo ELW normaly 60000)
+ *
+ * Output:
+ * scan:        laser scan
+ * intensity:   intensity of laser scan
+ */
+void distanceFilter(std::vector<float>&scan, std::vector<float>& intensities, int minDist, int maxDist);
 /*
  * filter out single points from the scan
  * Input:
@@ -142,6 +157,7 @@ void cleanUpScan(std::vector<float> &scan);
 void sortingScanOnLineToMirror(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& mirror, std::vector<float>& m_intens, bool* mask_linepoints, std::vector<cv::Point2f> line_points, float threshold);
 void sortingScanOnLineToMirror_multi(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& mirror, std::vector<float>& m_intens, std::vector<bool*>& mask_linepoints, std::vector<cv::Point2f> line_points, float threshold);
 
+
 /*
  * take the masked points and put all data from the scan into the affected area, which are masked = true
  * Input:
@@ -151,7 +167,6 @@ void sortingScanOnLineToMirror_multi(std::vector<float>& scan, std::vector<float
  * Output:
  * affected:          laser scan
  */
-//void scanRefilteredToAffected(std::vector<float> scan, std::vector<float>& affected, bool* mask_linepoints);
 void sortingScanOnLineToAffected(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& affected, std::vector<float>& a_intens, bool* mask_linepoints);
 void sortingScanOnLineToAffected_multi(std::vector<float>& scan, std::vector<float>& s_intens, std::vector<float>& affected, std::vector<float>& a_intens, std::vector<bool*>& mask_linepoints);
 
@@ -172,13 +187,10 @@ void sortingScanOnLineToAffected_multi(std::vector<float>& scan, std::vector<flo
  */
 bool subtractScans(sensor_msgs::LaserScan& first, sensor_msgs::LaserScan& last, sensor_msgs::LaserScan& good, sensor_msgs::LaserScan& mirror, sensor_msgs::LaserScan& affected, float threshold);
 
+void analyzeReflectionType(sensor_msgs::LaserScan& mirror, sensor_msgs::LaserScan& affected_mirror, sensor_msgs::LaserScan& transp, sensor_msgs::LaserScan& affected_transp, float thres_int);
+
 void pubPoints();
 void pubLines();
 void pubLineList();
-
-/*
- * copy header of source scan to header of goal scan
- */
-void writeHeader(sensor_msgs::LaserScan& goal, const sensor_msgs::LaserScan& source);
 
 
